@@ -1,0 +1,56 @@
+jbloxDB License
+Version 1.0 – Inspired by Elastic License v2
+© 2025 Green Arrowhead LLP
+
+This license governs the use of the jbloxDB software (the “Software”).
+
+You are permitted to use, modify, and distribute the Software, subject to the following terms:
+
+1. Definitions
+
+"Production Environment" refers to any usage of the Software that is customer-facing, publicly accessible, or used in live business operations.
+
+"Non-Production Environment" includes development, testing, internal evaluation, or personal use.
+
+"Annual Revenue" means gross annual revenue of the entity or organization in USD.
+
+"You" refers to an individual or an organization using the Software.
+
+2. Grant of Use
+
+2.1 Individuals  
+Individuals may freely use, modify, and distribute the Software in any environment (development, testing, production) for personal or non-commercial use.
+
+2.2 Companies with Annual Revenue < USD 5.0 Million  
+Such companies may use, modify, and distribute the Software free of charge in all environments, including production.
+
+2.3 Companies with Annual Revenue ≥ USD 5.0 Million  
+May freely use, modify, and distribute the Software in non-production environments (development, testing).  
+Must obtain a commercial license from Green Arrowhead LLP to use the Software (modified or unmodified) in production environments.
+
+2.4 Product Integration or Cloud-Based Services  
+Any company (regardless of revenue) intending to:  
+- Include the Software in a product suite, or  
+- Provide Software as a service or host it on behalf of customers (cloud usage),  
+must obtain a commercial license from Green Arrowhead LLP.
+
+3. Restrictions
+
+You may not remove, obscure, or modify any licensing notices in the Software.  
+You may not sublicense the Software without prior written consent.
+
+4. No Trademark License
+
+This license does not grant any rights to use Green Arrowhead LLP’s name, logos, or trademarks.
+
+5. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+6. Contact
+
+For commercial licensing inquiries, please contact:  
+Green Arrowhead LLP  
+[contact@greenarrowhead.com/www.greenarrowhead.com]
+
+Note: This license is inspired by Elastic License v2 but contains additional terms unique to Green Arrowhead LLP. It is not OSI-approved open source.

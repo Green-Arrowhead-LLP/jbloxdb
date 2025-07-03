@@ -27,7 +27,7 @@ jobs:
         tar -czvf yourapp-linux.tar.gz -C dist jbloxDB
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: yourapp-linux
         path: yourapp-linux.tar.gz

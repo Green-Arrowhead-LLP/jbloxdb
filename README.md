@@ -25,11 +25,7 @@ Key Features:
 
 Installation:
 
-1. Install Rust: https://www.jbloxdb.com/install
-2. Clone the repository:  
-   `git clone https://github.com/Green-Arrowhead-LLP/jbloxDB.git`
-3. Build the project:  
-   `cargo build --release`
+GitHub:   `https://github.com/Green-Arrowhead-LLP/jbloxdb`
 
 --------
 

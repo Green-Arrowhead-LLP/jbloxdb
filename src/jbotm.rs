@@ -93,6 +93,7 @@ pub struct Settings {
     repindexdelimiter: char,
     reprecorddelimiter: char,
     maxgetrecords: usize,
+    maxrecordlength: usize,
 } 
 pub struct jbothandler {
     settings: Settings,
@@ -532,7 +533,7 @@ impl jbothandler {
     }
 
     pub fn print_line_forpointer(&self, start_ptr: PtrWrapper) -> std::io::Result<String> {
-        let max_len = 40960;
+        let max_len: usize = self.settings.maxrecordlength;
         let mut bytes = Vec::new();
 
         for i in 0..max_len {

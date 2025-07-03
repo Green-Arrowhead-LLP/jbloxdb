@@ -26,6 +26,9 @@ logdir = "./log"
 #max number of records in get
 maxgetrecords = 100
 
+#maximum length of record
+maxrecordlength = 40960
+
 #max number of lines in log file before creating a new one
 #'0' indicates do not recreate ever.
 logmaxlines = 500

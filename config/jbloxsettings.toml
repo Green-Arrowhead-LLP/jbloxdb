@@ -18,10 +18,10 @@ initfilesize = 1
 newfilesizemultiplier = 2 
 
 #directory containing data files
-datadir = "C:/dev/jbloxdb/jbolxWorkspace/data"
+datadir = "./data"
 
 #directory for log file
-logdir = "C:/dev/jbloxdb/jbolxWorkspace/log"
+logdir = "./log"
 
 #max number of records in get
 maxgetrecords = 100

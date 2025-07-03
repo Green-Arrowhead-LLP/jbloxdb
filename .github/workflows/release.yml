@@ -1,10 +1,9 @@
-name: Build and Package for Linux
+name: Build and Package for Linux (Static)
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-linux:
@@ -17,17 +16,23 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Build Release Binary
-      run: cargo build --release
+    - name: Install musl-tools
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-    - name: Create .tar.gz Package
+    - name: Add musl target
+      run: rustup target add x86_64-unknown-linux-musl
+
+    - name: Build Static Binary
+      run: cargo build --release --target x86_64-unknown-linux-musl
+
+    - name: Package Binary
       run: |
         mkdir -p dist/
-        cp target/release/jbloxdb dist/
-        tar -czvf jsondb-linux.tar.gz -C dist jbloxdb
+        cp target/x86_64-unknown-linux-musl/release/jbloxdb dist/
+        tar -czvf jbloxdb-linux-static.tar.gz -C dist jbloxdb
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: jsondb-linux
-        path: jsondb-linux.tar.gz
+        name: jbloxdb-linux-static
+        path: jbloxdb-linux-static.tar.gz

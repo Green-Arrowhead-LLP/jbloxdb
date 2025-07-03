@@ -3,7 +3,7 @@
 # Licensed under the jbloxDB License v1.0
 # See LICENSE.txt for terms.
 # Free for individuals and small companies.
-# Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
+# Commercial license required for production use by companies over USD 5M annual revenue or for SaaS/product distribution.
 
 [package]
 name = "jbloxdb"

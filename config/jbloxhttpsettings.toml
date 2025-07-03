@@ -15,7 +15,7 @@ port = "3000"
 maxbuffer = 8192
 
 #html directory
-htmldir = "C:/dev/jbloxdb/jbolxWorkspace/html"
+htmldir = "./html"
 
 #default page
 defaultpage = "test.html"

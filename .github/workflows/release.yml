@@ -29,6 +29,8 @@ jobs:
         cp target/x86_64-unknown-linux-musl/release/jbloxdb dist/
         cp -r config dist/
         cp -r html dist/
+        cp -r data dist/
+        cp -r log dist/        
         tar -czvf jbloxdb-linux-static.tar.gz -C dist .
 
     - name: Upload Artifact

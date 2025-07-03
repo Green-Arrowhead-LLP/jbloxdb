@@ -24,7 +24,7 @@ jobs:
       run: |
         mkdir -p dist/
         cp target/release/jbloxDB dist/
-        tar -czvf yourapp-linux.tar.gz -C dist jbloxDB
+        tar -czvf yourapp-linux.tar.gz -C dist jbloxdb
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

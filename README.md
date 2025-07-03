@@ -1,4 +1,4 @@
-jbloxDB [![Latest Release](https://github.com/Green-Arrowhead-LLP/jbloxdb)](https://github.com/Green-Arrowhead-LLP/jbloxdb/releases/latest)
+jbloxDB [⬇️ Download Latest Release](https://github.com/Green-Arrowhead-LLP/jbloxdb/releases/latest)
 --------
 
 A zero-metadata configuration, high-performance JSON data management system developed in Rust.

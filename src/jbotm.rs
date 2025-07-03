@@ -319,7 +319,6 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
 impl jbothandler {
 
     pub fn new() -> io::Result<Self> {
-
         //get config file path
         let config_path = get_config_path();
         println!("Config file path: {}",config_path.to_str().unwrap());
@@ -356,6 +355,7 @@ impl jbothandler {
         let mut log_line_count: usize = 0;
 
         let log_filename = format!("{}/jblox.log", logdir);
+        println!("log_filename : {}",log_filename);
         let log_file = BufWriter::new(
             OpenOptions::new().create(true).append(true).open(&log_filename)?
         );
@@ -393,6 +393,8 @@ impl jbothandler {
         let state = Arc::new(Mutex::new(SharedState {
             file_mmap_map,
         }));
+        print!("log dir: {}",logdir);
+        print!("datadir dir: {}",datadir);
         Ok(Self {settings,
                 file_len_map, 
                 file_size_map, 

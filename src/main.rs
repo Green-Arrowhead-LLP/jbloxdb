@@ -53,12 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config deserialize error: {}", e)))?;
 
 
-
+    println!("htmldir dir: {}",settings.htmldir);
     // Create a thread-safe shared instance of jbothandler wrapped in Arc and Mutex
     let handler = Arc::new(Mutex::new(jbothandler::new().unwrap()));
 
     // Bind the TCP listener to localhost at port 3000
     let listener = TcpListener::bind(format!("{}:{}", settings.ip, settings.port)).await?;
+
 
     // Accept incoming connections in an infinite loop
     loop {

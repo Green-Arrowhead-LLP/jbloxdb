@@ -28,6 +28,8 @@ jobs:
       run: |
         mkdir -p dist/
         cp target/x86_64-unknown-linux-musl/release/jbloxdb dist/
+        cp -r config dist/
+        cp -r html dist/
         tar -czvf jbloxdb-linux-static.tar.gz -C dist jbloxdb
 
     - name: Upload Artifact

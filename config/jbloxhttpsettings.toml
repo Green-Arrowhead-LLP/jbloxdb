@@ -1,0 +1,22 @@
+# jbloxDB
+# © 2025 Green Arrowhead LLP
+# Licensed under the jbloxDB License v1.0
+# See LICENSE.txt for terms.
+# Free for individuals and small companies.
+# Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
+
+#httpserver ip
+ip = "localhost" 
+
+#httpserver port
+port = "3000"
+
+#request buffer size
+maxbuffer = 8192
+
+#html directory
+htmldir = "C:/dev/jbloxdb/jbolxWorkspace/html"
+
+#default page
+defaultpage = "test.html"
+

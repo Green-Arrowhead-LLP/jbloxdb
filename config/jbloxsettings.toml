@@ -1,0 +1,52 @@
+# jbloxDB
+# © 2025 Green Arrowhead LLP
+# Licensed under the jbloxDB License v1.0
+# See LICENSE.txt for terms.
+# Free for individuals and small companies.
+# Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
+
+
+#initial file size (in MBs), file size of data file (used to store data)
+#that you expect not to out grow soon. You will have to restart
+#jbloxDB if file size is reached. jbloxDB might restart on its own
+#if jbloxDB is not started by the admin. (current default to 100 MB)
+initfilesize = 1 
+
+#once file size reaches initfilesize, jbloxDB increases size by this
+#multiple, for the first time and thereafter everytime it reaches the
+#new max size
+newfilesizemultiplier = 2 
+
+#directory containing data files
+datadir = "C:/dev/jbloxdb/jbolxWorkspace/data"
+
+#directory for log file
+logdir = "C:/dev/jbloxdb/jbolxWorkspace/log"
+
+#max number of records in get
+maxgetrecords = 100
+
+#max number of lines in log file before creating a new one
+#'0' indicates do not recreate ever.
+logmaxlines = 500
+ 
+#delimiter used to separate name and value of index
+indexnamevaluedelimiter = "-"
+
+#delimiter used to separate multiple keys
+indexdelimiter = "`"
+
+#delimeter used to separate timestamp;keys;records in the database files
+recorddelimiter = ":"
+
+#replacemenet for indexnamevaluedelimiter, if record contain delimter
+#used by jbloxdb, they will be replace by the following
+repindexnamevaluedelimiter = "_"
+
+#replacemenet for indexdelimiter, if record contain delimter
+#used by jbloxdb, they will be replace by the following
+repindexdelimiter = "_"
+
+#replacemenet for recorddelimiter, if record contain delimter
+#used by jbloxdb, they will be replace by the following
+reprecorddelimiter = "_"

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Send JSON to Rust Server</title>
+  <style>
+    textarea {
+      width: 100%;
+      height: 200px;
+      margin-top: 10px;
+      font-family: monospace;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px;
+      border: 1px solid #ccc;
+    }
+  </style>
+  
+  <style>
+  .active-start {
+    background-color: #28a745;
+    color: white;
+  }
+  .active-stop {
+    background-color: #dc3545;
+    color: white;
+  }
+</style>
+
+
+</head>
+<body>
+  <h2>Send JSON to Rust Server</h2>
+
+  <label><b>Select JSON file:</b></label><br>
+  <input type="file" id="jsonFile" accept=".json" />
+  <br><br>
+
+  <label><b>Or paste JSON here:</b></label><br>
+  <textarea id="jsonText">{
+  "op": "get",
+  "data": {
+    "key": "id,name",
+    "keyobj": "user",
+    "id": "user12345",
+    "name": "Alice james",
+    "email": "alice@example.com"
+  }
+}</textarea>
+  <br>
+
+  <button onclick="uploadJson()">Send to Server</button>
+	<!-- Add interval input and buttons -->
+	<br>
+	<label><b>Interval (ms):</b></label>
+	<input type="number" id="interval" value="1000" min="100" step="100">
+	<br><br>
+<button id="startBtn" onclick="startAutoSend()">Start Auto Send</button>
+<button id="stopBtn" onclick="stopAutoSend()">Stop</button>
+
+  <h3>Server Response:</h3>
+  <pre id="responseBox"></pre>
+
+
+<script>
+  let autoSendInterval = null;
+
+  async function uploadJson() {
+    const fileInput = document.getElementById("jsonFile");
+    const textarea = document.getElementById("jsonText");
+    const responseBox = document.getElementById("responseBox");
+
+    let jsonData = null;
+
+    if (fileInput.files.length > 0) {
+      const file = fileInput.files[0];
+      const text = await file.text();
+      try {
+        jsonData = JSON.parse(text);
+      } catch (err) {
+        responseBox.textContent = "Invalid JSON in file.";
+        return;
+      }
+    } else if (textarea.value.trim()) {
+      try {
+        jsonData = JSON.parse(textarea.value.trim());
+      } catch (err) {
+        responseBox.textContent = "Invalid JSON in textarea.";
+        return;
+      }
+    } else {
+      responseBox.textContent = "Please select a file or paste JSON.";
+      return;
+    }
+
+    try {
+      const res = await fetch("/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(jsonData),
+      });
+
+      const resText = await res.text();
+      try {
+        const parsed = JSON.parse(resText);
+        responseBox.textContent = `Server response (formatted):\n${JSON.stringify(parsed, null, 2)}`;
+      } catch {
+        responseBox.textContent = `Server response:\n${resText}`;
+      }
+    } catch (err) {
+      responseBox.textContent = `Failed to send request:\n${err}`;
+    }
+  }
+
+  
+
+  function updateButtonStyles(isRunning) {
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    if (isRunning) {
+      startBtn.classList.add("active-start");
+      stopBtn.classList.remove("active-stop");
+    } else {
+      startBtn.classList.remove("active-start");
+      stopBtn.classList.add("active-stop");
+    }
+  }
+
+  function startAutoSend() {
+    const intervalMs = parseInt(document.getElementById("interval").value, 10) || 1000;
+    if (autoSendInterval) clearInterval(autoSendInterval);
+    autoSendInterval = setInterval(uploadJson, intervalMs);
+    updateButtonStyles(true);
+  }
+
+  function stopAutoSend() {
+    if (autoSendInterval) {
+      clearInterval(autoSendInterval);
+      autoSendInterval = null;
+    }
+    updateButtonStyles(false);
+  }
+  
+</script>
+
+<script>
+  async function uploadJson() {
+    const fileInput = document.getElementById("jsonFile");
+    const textarea = document.getElementById("jsonText");
+    const responseBox = document.getElementById("responseBox");
+
+    let jsonData = null;
+
+    // Try file input first
+    if (fileInput.files.length > 0) {
+      const file = fileInput.files[0];
+      const text = await file.text();
+      try {
+        jsonData = JSON.parse(text);
+      } catch (err) {
+        responseBox.textContent = "Invalid JSON in file.";
+        return;
+      }
+    } else if (textarea.value.trim()) {
+      try {
+        jsonData = JSON.parse(textarea.value.trim());
+      } catch (err) {
+        responseBox.textContent = "Invalid JSON in textarea.";
+        return;
+      }
+    } else {
+      responseBox.textContent = "Please select a file or paste JSON.";
+      return;
+    }
+
+    // Send to server
+    try {
+      const res = await fetch("/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(jsonData),
+      });
+
+      const resText = await res.text();
+      
+      try {
+        const parsed = JSON.parse(resText);
+		responseBox.textContent = `Server response (formatted):\n${JSON.stringify(parsed, null, 2)}`;
+      } catch {
+        responseBox.textContent = `Server response:\n${resText}`;
+      }
+    } catch (err) {
+      responseBox.textContent = `Failed to send request:\n${err}`;
+    }
+  }
+</script>
+</body>
+</html>

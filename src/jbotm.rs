@@ -94,6 +94,8 @@ pub struct Settings {
     reprecorddelimiter: char,
     maxgetrecords: usize,
     maxrecordlength: usize,
+    enableviewdelete: bool,
+
 } 
 pub struct jbothandler {
     settings: Settings,
@@ -117,7 +119,123 @@ struct SharedState {
 /// Finds the byte offset of the start of the last line (after the last `\n`).
 /// Returns `0` if file doesn't exist, is empty, or has no newlines.
 
-pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
+pub fn find_last_data_offset(path: &str) -> std::io::Result<u64> {
+    const BLOCK_SIZE: usize = 8192;
+
+    let file_path = Path::new(path);
+    if !file_path.exists() {
+        eprintln!("⚠️ File not found: {}", path);
+        return Ok(0);
+    }
+
+    let mut file = File::open(file_path)?;
+    let filesize = file.metadata()?.len();
+    if filesize == 0 {
+        eprintln!("⚠️ File is empty: {}", path);
+        return Ok(0);
+    }
+
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let mut low = 0;
+    let mut high = filesize;
+
+    // 🚀 Binary search for end of text region
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+
+        file.seek(SeekFrom::Start(mid))?;
+        let bytes_read = file.read(&mut buf)?;
+
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        let mut has_printable_text = false;
+
+        for offset in 0..=3 {
+            if bytes_read > offset {
+                let slice = &buf[offset..bytes_read];
+
+                if let Ok(text) = std::str::from_utf8(slice) {
+                    if text.chars().any(|c| !c.is_whitespace() && !c.is_control()) {
+                        has_printable_text = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if has_printable_text {
+            low = mid; // ✅ Move cautiously
+        } else {
+            high = mid;
+        }
+    }
+
+    // 🛡 Safer low with +4 bytes
+    let low_safe = (low + 4).min(filesize);
+    let start_pos = low_safe.saturating_sub(BLOCK_SIZE as u64 * 4);
+    let mut pos = low_safe + BLOCK_SIZE as u64;
+    let mut last_newline: Option<u64> = None;
+
+    //eprintln!("🔍 Backward scan from offset: {}", pos);
+
+    while pos > start_pos {
+        let block_size = BLOCK_SIZE.min(pos as usize);
+        pos -= block_size as u64;
+
+        if pos > start_pos {
+            pos -= 4; // overlap for UTF-8 safety
+        }
+
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut buf[..block_size])?;
+
+        let mut has_printable_text = false;
+        for offset in 0..=3 {
+            if block_size > offset {
+                let slice = &buf[offset..block_size];
+                if let Ok(text) = std::str::from_utf8(slice) {
+                    if text.chars().any(|c| !c.is_whitespace() && !c.is_control()) {
+                        has_printable_text = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !has_printable_text {
+            continue; // skip block
+        }
+
+        for i in (0..block_size).rev() {
+            if buf[i] == b'\n' {
+                last_newline = Some(pos + i as u64);
+                break;
+            }
+        }
+
+        if last_newline.is_some() {
+            break;
+        }
+    }
+
+    if let Some(nl_pos) = last_newline {
+        println!("✅ Found last newline at byte offset: {}", nl_pos);
+        Ok(nl_pos + 1)
+    } else {
+        println!("⚠️ No newline found in file");
+        Ok(0)
+    }
+}
+
+
+
+
+
+
+
+pub fn find_last_data_offset_non_binary_search(path: &str) -> io::Result<u64> {
     const BLOCK_SIZE: usize = 8192;
 
     let file_path = Path::new(path);
@@ -144,8 +262,26 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
         let block_size = BLOCK_SIZE.min(pos as usize);
         pos -= block_size as u64;
 
+        //07-07-2025 : handle cases wherein \n sits right
+        //between blocks
+        if pos > 0 {
+            // Overlap by 1 byte (so we don't miss a newline on a block boundary)
+            pos -= 1;
+        }
+        // till here
+
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut buf[..block_size])?;
+
+        //improve perfomance by checking if block starts wih utf-8, if not
+        //skip the block, as that would mean that block is empty anyways
+        
+        //07-07-2025 : Check if block starts with valid UTF-8 char
+        let first_utf8 = std::str::from_utf8(&buf[..4]); // read up to 4 bytes for a UTF-8 char
+        if first_utf8.is_err() {
+            continue; // Not UTF-8 → skip block
+        }
+        // till here
 
         // Search from end of buffer to start
         for i in (0..block_size).rev() {
@@ -214,6 +350,7 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
         recorddelimiter: &str,
         indexdelimiter: &str,
         indexnamevaluedelimiter: &str,
+        enableviewdelete: bool,
         file_len_map: &mut HashMap<String, usize>,
         file_size_map: &mut HashMap<String, usize>,
         file_mmap_map: &mut HashMap<String, memmap2::MmapMut>,
@@ -226,6 +363,8 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
             if path.extension().and_then(|e| e.to_str()) == Some("jblox") {
 
                 let fileactualsize = find_last_data_offset(filepath)?;
+                //let fileactualsize = find_last_data_offset_non_binary_search(filepath)?;
+                
 
                 let fname = path.file_stem().unwrap().to_string_lossy().to_string();
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
@@ -257,7 +396,7 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
                         };
                         if let Ok(text) = std::str::from_utf8(slice) {
                             let t = text.trim_end_matches('\n');
-                            if t.starts_with("00") {
+                            if enableviewdelete || t.starts_with("00") {
                                 if let Some(a) = t.find(recorddelimiter) {
                                     if let Some(b) = t[a + 1..].find(recorddelimiter) {
                                         let field = t[a + 1..a + 1 + b].trim();
@@ -287,7 +426,7 @@ pub fn find_last_data_offset(path: &str) -> io::Result<u64> {
                     };
                     if let Ok(text) = std::str::from_utf8(slice) {
                         let t = text.trim_end_matches('\n');
-                        if t.starts_with("00") {
+                        if enableviewdelete || t.starts_with("00") {
                             if let Some(a) = t.find(recorddelimiter) {
                                 if let Some(b) = t[a + 1..].find(recorddelimiter) {
                                     let field = t[a + 1..a + 1 + b].trim();
@@ -382,6 +521,7 @@ impl jbothandler {
                                     &recorddelimiter.to_string(), 
                                     &indexdelimiter.to_string(), 
                                     &indexnamevaluedelimiter.to_string(),
+                                    settings.enableviewdelete,
                                     &mut file_len_map,
                                     &mut file_size_map,
                                     &mut file_mmap_map,
@@ -434,6 +574,7 @@ impl jbothandler {
                                     &self.settings.recorddelimiter.to_string(), 
                                     &self.settings.indexdelimiter.to_string(), 
                                     &self.settings.indexnamevaluedelimiter.to_string(),
+                                    self.settings.enableviewdelete,
                                     &mut self.file_len_map,
                                     &mut self.file_size_map,
                                     &mut file_mmap_map_t,
@@ -534,7 +675,7 @@ impl jbothandler {
         }
     }
 
-    pub fn print_line_forpointer(&self, start_ptr: PtrWrapper) -> std::io::Result<String> {
+    pub fn print_line_forpointer(&self, start_ptr: PtrWrapper, includedelete: bool) -> std::io::Result<String> {
         let max_len: usize = self.settings.maxrecordlength;
         let mut bytes = Vec::new();
 
@@ -548,8 +689,12 @@ impl jbothandler {
                         Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                     };
 
-                    // Only return if line starts with "00"
-                    if line.starts_with("00") {
+                    //Only return if line starts with "00"
+                    //if includedelete is not true
+                    if includedelete && self.settings.enableviewdelete {
+                        return Ok(line.to_string());
+                    } 
+                    else if line.starts_with("00") {
                         return Ok(line.to_string());
                     } else {
                         return Ok("".to_string());
@@ -686,8 +831,8 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
                 // Call the existing method
 
                 if check_duplicates {
-                    let key_map = self.extract_keyname_value_map(&json)?;
-                    if let Some(ptrs) = self.get_fromkey_onlypointers(file_name, &key_map) {
+                    //let key_map = self.extract_keyname_value_map(&json)?;
+                    if let Ok(ptrs) = self.getmain(json_str,true,false,false) {
                         if !ptrs.is_empty() {
                             print!("Duplicate Records");
                             return Err(Error::new(ErrorKind::Other, "Duplicate Record."));
@@ -1002,12 +1147,74 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         Ok(lines)
     }
 
+
+
+    pub fn gethistall(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        if !self.settings.enableviewdelete {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied, // Use PermissionDenied or Other
+                "EnableViewDelete feature not enabled.",
+            ));
+        }
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-gethistall-{}",currtstmp, compact_jsonstr))?;
+
+       return self.getmain(&json_str, false,true,false);  
+    }
+
+    pub fn gethist(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        if !self.settings.enableviewdelete {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied, // Use PermissionDenied or Other
+                "EnableViewDelete feature not enabled.",
+            ));
+        }
+        
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-gethist-{}",currtstmp, compact_jsonstr))?;
+    
+
+       return self.getmain(&json_str, true,true,false);  
+    }
+
+
+    pub fn gethistalldesc(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        if !self.settings.enableviewdelete {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied, // Use PermissionDenied or Other
+                "EnableViewDelete feature not enabled.",
+            ));
+        }
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-gethistalldesc-{}",currtstmp, compact_jsonstr))?;
+
+       return self.getmain(&json_str, false,true,true);  
+    }
+
+
+    pub fn gethistdesc(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        if !self.settings.enableviewdelete {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied, // Use PermissionDenied or Other
+                "EnableViewDelete feature not enabled.",
+            ));
+        }
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-gethistdesc-{}",currtstmp, compact_jsonstr))?;
+
+       return self.getmain(&json_str, true,true,true);  
+    }  
+
     pub fn get(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
         let currtstmp:String = self.current_timestamp();
         let compact_jsonstr = self.compact_json_str(&json_str)?;
         self.log_message(&format!("{}-get-{}",currtstmp, compact_jsonstr))?;
 
-        return self.getmain(&json_str,  true);  
+        return self.getmain(&json_str,  true,false,false);  
     }
 
     pub fn getall(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
@@ -1015,11 +1222,32 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         let compact_jsonstr = self.compact_json_str(&json_str)?;
         self.log_message(&format!("{}-getall-{}",currtstmp, compact_jsonstr))?;
 
-       return self.getmain(&json_str, false);  
+       return self.getmain(&json_str, false,false,false);  
     }
 
+    pub fn getdesc(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-getdesc-{}",currtstmp, compact_jsonstr))?;
+
+        return self.getmain(&json_str,  true,false,true);  
+    }
+    
+    pub fn getalldesc(&mut self, json_str: &str) -> std::io::Result<Vec<String>> {
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-getalldesc-{}",currtstmp, compact_jsonstr))?;
+
+       return self.getmain(&json_str, false,false,true);  
+    }
+
+  
     //apply AND between the keys
-    pub fn getmain(&mut self, json_str: &str,use_intersection: bool,) -> std::io::Result<Vec<String>> {
+    pub fn getmain(&mut self, 
+                    json_str: &str,
+                    use_intersection: bool,
+                    includedelete: bool,
+                    reverse: bool,) -> std::io::Result<Vec<String>> {
 
         use std::io::{Error, ErrorKind};
         use serde_json::Value;
@@ -1043,7 +1271,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         //get key->keyvalue map
         let key_map = self.extract_keyname_value_map(&json)?;    
         // Call the existing method
-        let lines = self.get_fromkey(file_name, &key_map, &recstart, use_intersection);
+        let lines = self.get_fromkey(file_name, &key_map, &recstart, use_intersection,includedelete,reverse);
         Ok(lines)
 
     }
@@ -1054,94 +1282,101 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         key_map: &HashMap<String, String>,
         recstart: &str, //if "0" send records from begining, else start from this record (including)
         use_intersection: bool,
+        includedelete: bool,
+        reverse: bool,   //send records in decending
     ) -> Vec<String> {
 
-        let mut sets: Vec<Vec<PtrWrapper>> = Vec::new(); // ✅ Keep duplicates
+        let mut result: Vec<PtrWrapper> = Vec::new(); // ✅ Flat vector
+        let mut found_keystart = recstart == "0";
 
-        for (keyname, keyvalue) in key_map {
-            if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
-                if let Some(val_map) = ptrmap.get(keyname) {
-                    if let Some(ptrs) = val_map.get(keyvalue) {
-                        sets.push(ptrs.iter().cloned().collect::<Vec<_>>());
+        if !use_intersection{
+            let mut seen = HashSet::new();
+
+            for (keyname, keyvalue) in key_map {
+                if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
+                    if let Some(val_map) = ptrmap.get(keyname) {
+                        if let Some(ptrs) = val_map.get(keyvalue) {
+                            for ptr in ptrs {
+                                let key = ptr.as_ptr(); // Use raw pointer for uniqueness
+                                if seen.insert(key) {
+                                    result.push(ptr.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+        else{
+            let mut is_first = true;
+
+            for (keyname, keyvalue) in key_map {
+                if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
+                    if let Some(val_map) = ptrmap.get(keyname) {
+                        if let Some(ptrs) = val_map.get(keyvalue) {
+                            if ptrs.is_empty() {
+                                result.clear(); // Found empty ptrs -> clear result
+                                break;
+                            }
+                            if is_first {
+                                result = ptrs.iter().cloned().collect();
+                                is_first = false;
+                            } else {
+                                result.retain(|ptr| {
+                                    ptrs.iter().any(|p| p.as_ptr() == ptr.as_ptr())
+                                });
+                                if result.is_empty() {
+                                    break; // Intersection became empty -> stop
+                                }
+                            }
+                        } else {
+                            result.clear(); // keyvalue missing -> clear result
+                            break;
+                        }
                     } else {
-                        eprintln!("No value '{}' for key '{}' in file '{}'", keyvalue, keyname, file_name);
-                        return Vec::new();
+                        result.clear(); // keyname missing -> clear result
+                        break;
                     }
                 } else {
-                    eprintln!("Key '{}' not found in file '{}'", keyname, file_name);
-                    return Vec::new();
+                    result.clear(); // ptrmap missing -> clear result
+                    break;
                 }
-            } else {
-                eprintln!("No key-pointer map for file '{}'", file_name);
-                return Vec::new();
             }
         }
 
-        let mut result_lines = Vec::with_capacity(self.settings.maxgetrecords);
+        if(reverse){
+            result.sort_by_key(|ptr| std::cmp::Reverse(ptr.as_ptr() as usize));
+        }
+        else{
+            result.sort_by_key(|ptr| ptr.as_ptr() as usize);
+        }
 
-        let mut found_keystart = recstart == "0";
+        let mut result_lines: Vec<String> = Vec::with_capacity(self.settings.maxgetrecords);
 
-        if use_intersection {
-            match sets.split_first() {
-                Some((first, rest)) => {
-                    let mut result = first.clone();
-                    for set in rest {
-                        result.retain(|ptr| set.contains(ptr));
-                    }
-
-                    for ptr in result {
-                        if result_lines.len() >= self.settings.maxgetrecords {
-                            break;
-                        }
-                        if let Ok(line) = self.print_line_forpointer(ptr) {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            if !found_keystart {
-                                if line.starts_with(&format!("{}", recstart)) {
-                                    found_keystart = true;
-                                    result_lines.push(line.to_string());
-                                }
-                            } else {
-                                result_lines.push(line.to_string());
-                            }
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("Empty key_map");
-                    return Vec::new();
-                }
+        for ptr in result {
+            if result_lines.len() >= self.settings.maxgetrecords {
+                break;
             }
-        } else {
-            'outer: for set in sets {
-                for ptr in set {
-                    if result_lines.len() >= self.settings.maxgetrecords {
-                        break 'outer;
-                    }
-                    if let Ok(line) = self.print_line_forpointer(ptr) {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
+            if let Ok(line) = self.print_line_forpointer(ptr,includedelete) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
 
-                        if !found_keystart {
-                            if line.starts_with(&format!("{}", recstart)) {
-                                found_keystart = true;
-                                result_lines.push(line.to_string());
-                            }
-                        } else {
-                            result_lines.push(line.to_string());
-                        }
+                if !found_keystart {
+                    if line.starts_with(&format!("{}", recstart)) {
+                        found_keystart = true;
+                        result_lines.push(line.to_string());
                     }
+                } else {
+                    result_lines.push(line.to_string());
                 }
             }
         }
 
         if result_lines.is_empty() {
-            eprintln!("No matching records found.");
+            //eprintln!("No matching records found.");
             return Vec::new();
         }
 
@@ -1339,8 +1574,14 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 self.delete(&data_str)?;
                 ok_response()
             }
+            "gethist" => self.gethist(&data_str),
+            "gethistdesc" => self.gethistdesc(&data_str),
+            "gethistall" => self.gethistall(&data_str),
+            "gethistalldesc" => self.gethistalldesc(&data_str),
             "getall" => self.getall(&data_str),
             "get" => self.get(&data_str),
+            "getalldesc" => self.getalldesc(&data_str),
+            "getdesc" => self.getdesc(&data_str),
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Unknown op: {op}"))),
         }
     }

@@ -3,20 +3,33 @@
 # Licensed under the jbloxDB License v1.0
 # See LICENSE.txt for terms.
 # Free for individuals and small companies.
-# Commercial license required for production use by companies over USD 5M annual revenue or for SaaS/product distribution.
+# Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
 
 [package]
 name = "jbloxdb"
 version = "0.1.0"
 edition = "2024"
 
+
 [dependencies]
+#
+#for tesing, do not include in the build
+#
+scrap = "0.5.0"
+image = "0.24"        # Needed to save screenshots as PNG/JPEG
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+base64 = "0.21"
+screenshots = "0.6"
+#
+#till here
+#
 anyhow = "1.0"
 internment = "0.4"
 memmap2 = "0.9"
 rand = "0.8"
 chrono = "0.4"
 config = "0.13"
+common = { path = "../common" }
 axum = "0.7"
 hyper = "1.2"
 tokio = { version = "1", features = ["full"] }

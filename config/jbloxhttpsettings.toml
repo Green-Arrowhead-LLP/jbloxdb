@@ -12,7 +12,7 @@ ip = "localhost"
 port = "3000"
 
 #request buffer size
-maxbuffer = 8192
+maxbuffer = 2097152
 
 #html directory
 htmldir = "./html"

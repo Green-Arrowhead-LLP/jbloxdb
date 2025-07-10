@@ -53,3 +53,9 @@ repindexdelimiter = "_"
 #replacemenet for recorddelimiter, if record contain delimter
 #used by jbloxdb, they will be replace by the following
 reprecorddelimiter = "_"
+
+#feature enables to view deleted records if they exist in the file
+enableviewdelete = false
+
+#max length of string to print on console for log
+maxlogtoconsolelength = 100

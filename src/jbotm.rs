@@ -94,6 +94,7 @@ pub struct Settings {
     reprecorddelimiter: char,
     maxgetrecords: usize,
     maxrecordlength: usize,
+    maxlogtoconsolelength: usize,
     enableviewdelete: bool,
 
 } 
@@ -359,6 +360,17 @@ pub fn find_last_data_offset_non_binary_search(path: &str) -> io::Result<u64> {
     ) -> std::io::Result<()> {
             let path = Path::new(filepath);
             let mut sizetobeused = (initfilesize*1000000.0); 
+
+            // Get current file size (in bytes)
+            let current_file_size = fs::metadata(path)
+                .map(|meta| meta.len() as f64) // Convert u64 to f64 for comparison
+                .unwrap_or(0.0); // If metadata fails, assume size 0
+
+            // Calculate initfilesize * 1_000_000.0
+            let init_size = initfilesize * 1_000_000.0;
+
+            // Use the larger of the two
+            let mut sizetobeused = current_file_size.max(init_size);
 
             if path.extension().and_then(|e| e.to_str()) == Some("jblox") {
 
@@ -1478,7 +1490,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
 
     pub fn log_message(&mut self, message: &str) -> std::io::Result<()> {
         writeln!(self.log_file, "{}", message)?;
-        println!("message: {}",message);
+        println!("message: {}", &message.chars().take(self.settings.maxlogtoconsolelength).collect::<String>());
         self.log_file.flush()?;
         self.log_line_count += 1;
 
@@ -1525,11 +1537,11 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
     }
     fn current_timestamp(&self) -> String {
         let now = chrono::Local::now();
-        now.format("%d%m%y%H%M%S%3f").to_string()
+        now.format("%d%m%y%H%M%S%6f").to_string()
     }
     
     fn current_timestamp_forlog() -> String {
-        Local::now().format("%d-%m-%y-%H-%M-%S-%3f").to_string()
+        Local::now().format("%d-%m-%y-%H-%M-%S-%6f").to_string()
     } 
 
     pub fn handle_request(&mut self, input: &str) -> std::io::Result<Vec<String>> {

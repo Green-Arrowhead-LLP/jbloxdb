@@ -6,6 +6,8 @@
 // Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
 
 use memmap2::{MmapMut, MmapOptions};
+use memchr::memchr_iter;
+use rayon::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -18,6 +20,7 @@ use serde::Deserialize;
 use config::Config;
 use chrono::Local;
 use anyhow::Result;
+use std::time::{Duration};
  
 use serde_json::{json};
 
@@ -35,6 +38,26 @@ use std::io::{BufRead, BufReader};
 use std::io::{Read};
 
 use std::sync::{Arc, Mutex};
+
+use libc;
+
+use memchr::memchr;
+
+use std::thread;
+use std::clone::Clone;
+
+#[cfg(unix)]
+unsafe fn discard_pages(ptr: *mut u8, len: usize) {
+    let ret = libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+    if ret != 0 {
+        eprintln!("madvise failed: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(windows)]
+unsafe fn discard_pages(_ptr: *mut u8, _len: usize) {
+    // Windows does not support madvise. No-op.
+}
 
 /// Thread-safe wrapper around a raw pointer into a memory-mapped file.
 #[derive(Debug)]
@@ -56,6 +79,10 @@ impl PtrWrapper {
     /// Compute offset from another pointer
     pub fn offset_from(&self, other: &Self) -> isize {
         unsafe { (*self.0.get()).offset_from(*other.0.get()) }
+    }
+    pub fn from_base_and_offset(base: *mut u8, offset: usize) -> Self {
+        let ptr = unsafe { base.add(offset) };
+        PtrWrapper::new(ptr)
     }
 }
 
@@ -79,10 +106,10 @@ impl std::hash::Hash for PtrWrapper {
 unsafe impl Send for PtrWrapper {}
 unsafe impl Sync for PtrWrapper {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize,Clone)]
 pub struct Settings {
     initfilesize:f64, //in MB
-    newfilesizemultiplier:usize, //new file size = this var times existing size
+    newfilesizemultiplier:f32, //new file size = this var times existing size
     datadir: String,
     logdir: String,
     logmaxlines: usize,
@@ -96,20 +123,22 @@ pub struct Settings {
     maxrecordlength: usize,
     maxlogtoconsolelength: usize,
     enableviewdelete: bool,
+    MADVISE_CHUNK: usize,
+    low_ram_mode: bool,
 
 } 
 pub struct jbothandler {
     settings: Settings,
-    file_len_map: HashMap<String, usize>, //file->file length
     file_size_map: HashMap<String, usize>, //file->file length
     //file_mmap_map: HashMap<String, MmapMut>,//file->mmep of file
-    file_line_map: HashMap<String, Vec<PtrWrapper>>,//file->pointer vector
+    file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>>,//file->pointer vector
     file_key_pointer_map: HashMap<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>, //file->key name -> key -> pointer
     datadir: String,
     logdir: String,
     log_file: BufWriter<File>,
     log_line_count : usize,
     state: Arc<Mutex<SharedState>>,
+    size_digits: usize,
 
 
 }
@@ -117,196 +146,43 @@ pub struct jbothandler {
 struct SharedState {
     file_mmap_map: HashMap<String, MmapMut>,
 }
-/// Finds the byte offset of the start of the last line (after the last `\n`).
-/// Returns `0` if file doesn't exist, is empty, or has no newlines.
 
-pub fn find_last_data_offset(path: &str) -> std::io::Result<u64> {
-    const BLOCK_SIZE: usize = 8192;
+    /// Quickly checks if any valid record exists in later half of file.
+    /// Returns true if found, false otherwise.
+    pub fn records_exist_in_second_half(
+        file: &mut File,
+        record_prefix: &[u8],
+        max_record_length: u64,
+    ) -> io::Result<bool> {
+        let filesize = file.metadata()?.len();
 
-    let file_path = Path::new(path);
-    if !file_path.exists() {
-        eprintln!("⚠️ File not found: {}", path);
-        return Ok(0);
-    }
+        if filesize == 0 || filesize <= max_record_length {
+            return Ok(false); // File too small to have records in second half
+        }
 
-    let mut file = File::open(file_path)?;
-    let filesize = file.metadata()?.len();
-    if filesize == 0 {
-        eprintln!("⚠️ File is empty: {}", path);
-        return Ok(0);
-    }
+        let midpoint = filesize / 2;
 
-    let mut buf = vec![0u8; BLOCK_SIZE];
-    let mut low = 0;
-    let mut high = filesize;
+        // Start scanning from midpoint backwards by max_record_length
+        let scan_start = midpoint.saturating_sub(max_record_length + 1);
+        let scan_len = (filesize - scan_start).min(max_record_length * 2); // Small scan window
+        let mut buf = vec![0u8; scan_len as usize];
 
-    // 🚀 Binary search for end of text region
-    while high - low > 1 {
-        let mid = (low + high) / 2;
-
-        file.seek(SeekFrom::Start(mid))?;
+        file.seek(SeekFrom::Start(scan_start))?;
         let bytes_read = file.read(&mut buf)?;
 
         if bytes_read == 0 {
-            break; // EOF
+            return Ok(false);
         }
 
-        let mut has_printable_text = false;
-
-        for offset in 0..=3 {
-            if bytes_read > offset {
-                let slice = &buf[offset..bytes_read];
-
-                if let Ok(text) = std::str::from_utf8(slice) {
-                    if text.chars().any(|c| !c.is_whitespace() && !c.is_control()) {
-                        has_printable_text = true;
-                        break;
-                    }
-                }
+        // Scan buffer for valid record prefix
+        for i in 0..(bytes_read - record_prefix.len()) {
+            if buf[i..i + record_prefix.len()] == *record_prefix {
+                return Ok(true); // Found a valid record
             }
         }
 
-        if has_printable_text {
-            low = mid; // ✅ Move cautiously
-        } else {
-            high = mid;
-        }
+        Ok(false) // No valid records found in later half
     }
-
-    // 🛡 Safer low with +4 bytes
-    let low_safe = (low + 4).min(filesize);
-    let start_pos = low_safe.saturating_sub(BLOCK_SIZE as u64 * 4);
-    let mut pos = low_safe + BLOCK_SIZE as u64;
-    let mut last_newline: Option<u64> = None;
-
-    //eprintln!("🔍 Backward scan from offset: {}", pos);
-
-    while pos > start_pos {
-        let block_size = BLOCK_SIZE.min(pos as usize);
-        pos -= block_size as u64;
-
-        if pos > start_pos {
-            pos -= 4; // overlap for UTF-8 safety
-        }
-
-        file.seek(SeekFrom::Start(pos))?;
-        file.read_exact(&mut buf[..block_size])?;
-
-        let mut has_printable_text = false;
-        for offset in 0..=3 {
-            if block_size > offset {
-                let slice = &buf[offset..block_size];
-                if let Ok(text) = std::str::from_utf8(slice) {
-                    if text.chars().any(|c| !c.is_whitespace() && !c.is_control()) {
-                        has_printable_text = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !has_printable_text {
-            continue; // skip block
-        }
-
-        for i in (0..block_size).rev() {
-            if buf[i] == b'\n' {
-                last_newline = Some(pos + i as u64);
-                break;
-            }
-        }
-
-        if last_newline.is_some() {
-            break;
-        }
-    }
-
-    if let Some(nl_pos) = last_newline {
-        println!("✅ Found last newline at byte offset: {}", nl_pos);
-        Ok(nl_pos + 1)
-    } else {
-        println!("⚠️ No newline found in file");
-        Ok(0)
-    }
-}
-
-
-
-
-
-
-
-pub fn find_last_data_offset_non_binary_search(path: &str) -> io::Result<u64> {
-    const BLOCK_SIZE: usize = 8192;
-
-    let file_path = Path::new(path);
-
-    if !file_path.exists() {
-        eprintln!("⚠️ File not found: {}", path);
-        return Ok(0);
-    }
-
-    let mut file = File::open(file_path)?;
-    let filesize = file.metadata()?.len();
-
-    if filesize == 0 {
-        eprintln!("⚠️ File is empty: {}", path);
-        return Ok(0);
-    }
-
-    let mut buf = vec![0u8; BLOCK_SIZE];
-    let mut pos = filesize;
-    let mut last_newline: Option<u64> = None;
-
-    // Step backwards in blocks
-    while pos > 0 {
-        let block_size = BLOCK_SIZE.min(pos as usize);
-        pos -= block_size as u64;
-
-        //07-07-2025 : handle cases wherein \n sits right
-        //between blocks
-        if pos > 0 {
-            // Overlap by 1 byte (so we don't miss a newline on a block boundary)
-            pos -= 1;
-        }
-        // till here
-
-        file.seek(SeekFrom::Start(pos))?;
-        file.read_exact(&mut buf[..block_size])?;
-
-        //improve perfomance by checking if block starts wih utf-8, if not
-        //skip the block, as that would mean that block is empty anyways
-        
-        //07-07-2025 : Check if block starts with valid UTF-8 char
-        let first_utf8 = std::str::from_utf8(&buf[..4]); // read up to 4 bytes for a UTF-8 char
-        if first_utf8.is_err() {
-            continue; // Not UTF-8 → skip block
-        }
-        // till here
-
-        // Search from end of buffer to start
-        for i in (0..block_size).rev() {
-            if buf[i] == b'\n' {
-                last_newline = Some(pos + i as u64);
-                break;
-            }
-        }
-
-        if last_newline.is_some() {
-            break;
-        }
-    }
-
-    if let Some(nl_pos) = last_newline {
-        println!("✅ Found last newline at byte offset: {}", nl_pos);
-        Ok(nl_pos + 1)
-    } else {
-        println!("⚠️ No newline found in file");
-        Ok(0)
-    }
-}
-
-
 
     pub fn get_config_path() -> PathBuf {
         let mut current_dir = match env::current_exe()
@@ -344,132 +220,274 @@ pub fn find_last_data_offset_non_binary_search(path: &str) -> io::Result<u64> {
         process::exit(1);
     }
 
-    pub fn load_existing_file(
-        initfilesize:f64,
-        filesizemultiplier:usize,
-        filepath: &str,
-        recorddelimiter: &str,
-        indexdelimiter: &str,
-        indexnamevaluedelimiter: &str,
-        enableviewdelete: bool,
-        file_len_map: &mut HashMap<String, usize>,
-        file_size_map: &mut HashMap<String, usize>,
-        file_mmap_map: &mut HashMap<String, memmap2::MmapMut>,
-        file_line_map: &mut HashMap<String, Vec<PtrWrapper>>,
-        file_key_pointer_map: &mut HashMap<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>,        
-    ) -> std::io::Result<()> {
-            let path = Path::new(filepath);
-            let mut sizetobeused = (initfilesize*1000000.0); 
 
-            // Get current file size (in bytes)
-            let current_file_size = fs::metadata(path)
-                .map(|meta| meta.len() as f64) // Convert u64 to f64 for comparison
-                .unwrap_or(0.0); // If metadata fails, assume size 0
+/////////////////////////////////////////////////////
 
-            // Calculate initfilesize * 1_000_000.0
-            let init_size = initfilesize * 1_000_000.0;
+pub fn load_existing_file(
+    initfilesize: f64,
+    filesizemultiplier: f32,
+    filepath: &str,
+    recorddelimiter: &str,
+    indexdelimiter: &str,
+    indexnamevaluedelimiter: &str,
+    enableviewdelete: bool,
+    low_ram_mode: bool,
+    MADVISE_CHUNK_S: usize,
+    size_digits: usize,
+    maxrecordlength: usize,
+    maxrecords: usize,
+    inputoffset: usize,
+    file_size_map: &mut HashMap<String, usize>,
+    file_mmap_map: &mut HashMap<String, memmap2::MmapMut>,
+    file_line_map: &mut HashMap<String, Vec<(PtrWrapper, usize)>>,
+    file_key_pointer_map: &mut HashMap<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>,
+) -> std::io::Result<usize> {
+    const TIMESTAMP_LEN: usize = 18;
+    let path = Path::new(filepath);
+    let mut offset: usize = inputoffset;
 
-            // Use the larger of the two
-            let mut sizetobeused = current_file_size.max(init_size);
+    if path.extension().and_then(|e| e.to_str()) == Some("jblox") {
+        let fname = path.file_stem().unwrap().to_string_lossy().to_string();
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let filemetadata = file.metadata()?;
+        let current_file_size = filemetadata.len() as usize;
 
-            if path.extension().and_then(|e| e.to_str()) == Some("jblox") {
+        let mut mmap: MmapMut = unsafe { MmapOptions::new().len(current_file_size).map_mut(&file)? };
+        let base: PtrWrapper = PtrWrapper(UnsafeCell::new(mmap.as_mut_ptr()));
+        let baseptr = base.as_ptr();
 
-                let fileactualsize = find_last_data_offset(filepath)?;
-                //let fileactualsize = find_last_data_offset_non_binary_search(filepath)?;
-                
+        let lines = file_line_map.entry(fname.clone()).or_insert_with(Vec::new);
+        let keymap = file_key_pointer_map.entry(fname.clone()).or_insert_with(HashMap::new);
 
-                let fname = path.file_stem().unwrap().to_string_lossy().to_string();
-                let file = OpenOptions::new().read(true).write(true).open(&path)?;
-                let metadata = file.metadata()?;
-                //get existing file size
+        let delim_u16 = if recorddelimiter.as_bytes().len() >= 2 {
+            u16::from_le_bytes(recorddelimiter.as_bytes()[0..2].try_into().unwrap())
+        } else {
+            u16::from_le_bytes([recorddelimiter.as_bytes()[0], 0])
+        };
 
-                let ratio = fileactualsize as f64/sizetobeused as f64;
-
-                let decimal_part = ratio.fract();
-                if(decimal_part) > 0.5{
-                    sizetobeused = fileactualsize as f64 * filesizemultiplier as f64;
-                }
-
-                file.set_len(sizetobeused as u64)?;
-                let mut mmap = unsafe { MmapOptions::new().len(sizetobeused as usize).map_mut(&file)? };
-                let len = mmap.len();
-                let base = PtrWrapper(UnsafeCell::new(mmap.as_mut_ptr()));
-                let mut lines = vec![base.clone()];
-                let mut keymap: HashMap<String, HashMap<String, Vec<PtrWrapper>>> = HashMap::new();
-
-                for i in 0..len {
-                    let curr = PtrWrapper(UnsafeCell::new(base.add(i)));
-                    if unsafe { *curr.as_ptr() } == b'\n' && i + 1 < len {
-                        let next = PtrWrapper(UnsafeCell::new(base.add(i + 1)));
-                        lines.push(next.clone());
-                        let prev = lines[lines.len() - 2].clone();
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(prev.as_ptr(), curr.offset_from(&prev) as usize)
-                        };
-                        if let Ok(text) = std::str::from_utf8(slice) {
-                            let t = text.trim_end_matches('\n');
-                            if enableviewdelete || t.starts_with("00") {
-                                if let Some(a) = t.find(recorddelimiter) {
-                                    if let Some(b) = t[a + 1..].find(recorddelimiter) {
-                                        let field = t[a + 1..a + 1 + b].trim();
-                                        for part in field.split(indexdelimiter) {
-                                            if let Some(p) = part.find(indexnamevaluedelimiter) {
-                                                let k = &part[..p];
-                                                let v = &part[p + 1..];
-                                                keymap.entry(k.to_string()).or_default()
-                                                    .entry(v.to_string()).or_default()
-                                                    .push(prev.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Last line
-                if let Some(last) = lines.last().cloned() {
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(
-                            last.as_ptr(),
-                            len - (last.as_ptr() as usize - mmap.as_ptr() as usize),
-                        )
-                    };
-                    if let Ok(text) = std::str::from_utf8(slice) {
-                        let t = text.trim_end_matches('\n');
-                        if enableviewdelete || t.starts_with("00") {
-                            if let Some(a) = t.find(recorddelimiter) {
-                                if let Some(b) = t[a + 1..].find(recorddelimiter) {
-                                    let field = t[a + 1..a + 1 + b].trim();
-                                    for part in field.split(indexdelimiter) {
-                                        if let Some(p) = part.find(indexnamevaluedelimiter) {
-                                            let k = &part[..p];
-                                            let v = &part[p + 1..];
-                                            keymap.entry(k.to_string()).or_default()
-                                                .entry(v.to_string()).or_default()
-                                                .push(last.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                file_mmap_map.insert(fname.clone(), mmap);
-                file_len_map.insert(fname.clone(), len);
-                file_size_map.insert(fname.clone(), fileactualsize as usize);
-                file_line_map.insert(fname.clone(), lines);
-                file_key_pointer_map.insert(fname.clone(), keymap);
-
-
+        while offset < current_file_size {
+            let size_start = offset + ((3 + TIMESTAMP_LEN + 1) * 2);
+            let size_end = size_start + (size_digits * 2);
+            if size_end > current_file_size {
+                break;
             }
-            Ok(())
-    }  
+
+            let size_slice = &mmap[size_start..size_end];
+            let size_utf16: Vec<u16> = size_slice.chunks(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            let size_str = String::from_utf16(&size_utf16).unwrap_or_else(|_| "0".to_string());
+
+            let record_len: usize = size_str.trim().parse::<usize>().unwrap_or(0);
+            if !size_str.trim().chars().all(|c| c.is_ascii_digit()) || record_len == 0 {
+                break;
+            }
+
+            if offset + record_len > current_file_size {
+                break;
+            }
+
+            let recptr = PtrWrapper::from_base_and_offset(baseptr, offset);
+            lines.push((recptr.clone(), record_len));
+
+            let mut i = size_end + 2;
+            let record_end = offset + record_len;
+            let mut key_u16 = Vec::with_capacity(128);
+            while i + 1 < record_end {
+                let u16_char = u16::from_le_bytes([mmap[i], mmap[i + 1]]);
+                if u16_char == delim_u16 {
+                    break;
+                }
+                key_u16.push(u16_char);
+                i += 2;
+            }
+
+            if let Ok(key_field) = String::from_utf16(&key_u16) {
+                for part in key_field.split(indexdelimiter) {
+                    if let Some(dash_pos) = part.find(indexnamevaluedelimiter) {
+                        let key_name = &part[..dash_pos];
+                        let key_value = &part[dash_pos + 1..];
+                        keymap.entry(key_name.to_string()).or_default()
+                            .entry(key_value.to_string()).or_default()
+                            .push(recptr.clone());
+                    }
+                }
+            }
+
+            offset += record_len;
+        }
+
+        file_mmap_map.insert(fname.clone(), mmap);
+        file_size_map.insert(fname.clone(), offset);
+    }
+
+    Ok(offset)
+}
+
+
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////
+
 
 impl jbothandler {
 
-    pub fn new() -> io::Result<Self> {
+
+pub fn new_thread() -> io::Result<Self> {
+    let config_path = get_config_path();
+    println!("Config file path: {}", config_path.to_str().unwrap());
+    let config = Config::builder()
+        .add_source(config::File::with_name(config_path.to_str().unwrap()))
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config build error: {}", e)))?;
+
+    let mut settings: Settings = config
+        .try_deserialize()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config deserialize error: {}", e)))?;
+
+        
+    let datadir = settings.datadir.clone();
+    let logdir = settings.logdir.clone();
+    let configdir = config_path.to_str().unwrap();
+
+    println!("config dir: {}", configdir.to_string());
+    println!("log dir: {}", logdir);
+    println!("datadir dir: {}", datadir);
+
+    let log_filename = format!("{}/jblox.log", logdir);
+    println!("log_filename : {}", log_filename);
+    let log_file = BufWriter::new(OpenOptions::new().create(true).append(true).open(&log_filename)?);
+
+    let log_path = std::path::Path::new(&log_filename);
+    let mut log_line_count: usize = 0;
+    if log_path.exists() {
+        if let Ok(logfileforlines) = File::open(log_path) {
+            let reader = BufReader::new(logfileforlines);
+            log_line_count = reader.lines().count();
+        }
+    }
+
+    let file_size_map = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let file_mmap_map = Arc::new(Mutex::new(HashMap::<String, MmapMut>::new()));
+    let file_line_map = Arc::new(Mutex::new(HashMap::<String, Vec<(PtrWrapper, usize)>>::new()));
+    let file_key_pointer_map = Arc::new(Mutex::new(HashMap::<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>::new()));
+
+    let size_digits = {
+        let max_length_digits = settings.maxrecordlength.to_string().len();
+        if max_length_digits >= 4 {
+            max_length_digits + 1
+        } else {
+            4
+        }
+    };
+
+    for entry in fs::read_dir(datadir.clone())? {
+        let path = entry?.path();
+        if !(path.extension().and_then(|ext| ext.to_str()) == Some("jblox")) {
+            continue;
+        }
+
+        let settings = settings.clone();
+        let path_str = path.to_string_lossy().to_string();
+        let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("UNKNOWN").to_string();
+
+        let mut currentoffset = 0;
+        let maxrecord = 40_000;
+        let mut currentrecordnum = 0;
+        let mut keeprunning = true;
+        let mut newrecordnum = 0;
+
+        while keeprunning {
+            let settings = settings.clone();
+            let path_str = path_str.clone();
+            let file_name_for_thread = file_name.clone(); // clone for this thread
+
+            let file_size_map_thread = Arc::clone(&file_size_map);
+            let file_mmap_map_thread = Arc::clone(&file_mmap_map);
+            let file_line_map_thread = Arc::clone(&file_line_map);
+            let file_key_pointer_map_thread = Arc::clone(&file_key_pointer_map);
+
+            let handle = thread::spawn(move || {
+                let offsetreturned = load_existing_file(
+                    settings.initfilesize,
+                    settings.newfilesizemultiplier,
+                    &path_str,
+                    settings.recorddelimiter.to_string().as_str(),
+                    settings.indexdelimiter.to_string().as_str(),
+                    settings.indexnamevaluedelimiter.to_string().as_str(),
+                    settings.enableviewdelete,
+                    settings.low_ram_mode,
+                    settings.MADVISE_CHUNK,
+                    size_digits,
+                    settings.maxrecordlength,
+                    maxrecord,
+                    currentoffset,
+                    &mut file_size_map_thread.lock().unwrap(),
+                    &mut file_mmap_map_thread.lock().unwrap(),
+                    &mut file_line_map_thread.lock().unwrap(),
+                    &mut file_key_pointer_map_thread.lock().unwrap(),
+                ).unwrap();
+
+                let newrecordnum = file_line_map_thread.lock().unwrap()
+                    .get(&file_name_for_thread).unwrap().len();
+                let mut size_map = file_size_map_thread.lock().unwrap();
+                size_map.insert(file_name_for_thread.clone(), offsetreturned);
+
+                println!(
+                    "newrecordnum - currentrecordnum : {}, maxrecord: {}", 
+                    newrecordnum - currentrecordnum, maxrecord
+                );
+            });
+
+            handle.join().expect("Thread panicked"); // wait for thread
+
+            // Update for next iteration
+            newrecordnum = {
+                let map = file_line_map.lock().unwrap();
+                map.get(&file_name).unwrap().len()
+            };
+
+            if (newrecordnum - currentrecordnum) < maxrecord {
+                keeprunning = false;
+            } else {
+                currentrecordnum = newrecordnum;
+                currentoffset = {
+                    let map = file_size_map.lock().unwrap();
+                    *map.get(&file_name).unwrap()
+                };
+            }
+        }
+
+        println!("Finished processing file: {}, total number of records: {}", file_name,newrecordnum);
+    }
+
+    let state = Arc::new(Mutex::new(SharedState {
+        file_mmap_map: Arc::try_unwrap(file_mmap_map).unwrap().into_inner().unwrap(),
+    }));
+
+    println!("Ready to accept requests.");
+    Ok(Self {
+        settings,
+        file_size_map: Arc::try_unwrap(file_size_map).unwrap().into_inner().unwrap(),
+        file_line_map: Arc::try_unwrap(file_line_map).unwrap().into_inner().unwrap(),
+        file_key_pointer_map: Arc::try_unwrap(file_key_pointer_map).unwrap().into_inner().unwrap(),
+        datadir,
+        logdir,
+        log_file,
+        log_line_count,
+        state,
+        size_digits,
+    })
+}
+
+
+    pub fn new_non_thread() -> io::Result<Self> {
         //get config file path
         let config_path = get_config_path();
         println!("Config file path: {}",config_path.to_str().unwrap());
@@ -478,18 +496,18 @@ impl jbothandler {
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config build error: {}", e)))?;
 
-        let settings: Settings = config
+        let mut settings: Settings = config
             .try_deserialize()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config deserialize error: {}", e)))?;
 
-        let initfilesize = settings.initfilesize;
-
-        let newfilesizemultiplier = settings.newfilesizemultiplier;
 
         //directory to be used to store data
         let datadir = settings.datadir.clone();
         //log directory
         let logdir = settings.logdir.clone();
+        println!("log dir: {}",logdir);
+        println!("datadir dir: {}",datadir);
+
         //log frequency in hours
         let logmaxlines: usize = settings.logmaxlines;
         //indexnamevalue delimiter
@@ -503,6 +521,14 @@ impl jbothandler {
         let repindexdelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
         let reprecorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
         
+        //set size_digits 
+        let mut size_digits = 4; // minimum width
+        let max_length_digits = settings.maxrecordlength.to_string().len();
+
+        if max_length_digits >= 4 {
+            size_digits = max_length_digits + 1;
+        }
+
         let mut log_line_count: usize = 0;
 
         let log_filename = format!("{}/jblox.log", logdir);
@@ -519,36 +545,94 @@ impl jbothandler {
             }
         }
 
-        let mut file_len_map = HashMap::new();
         let mut file_size_map = HashMap::new();
         let mut file_mmap_map = HashMap::new();
-        let mut file_line_map: HashMap<String, Vec<PtrWrapper>> = HashMap::new();
+        let mut file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>> = HashMap::new();
         let mut file_key_pointer_map = HashMap::new();
 
+
+
         for entry in std::fs::read_dir(datadir.clone())? {
-            let path = entry?.path(); 
-                load_existing_file(settings.initfilesize,
-                settings.newfilesizemultiplier,
-                          &path.to_string_lossy().to_string(), 
-                                    &recorddelimiter.to_string(), 
-                                    &indexdelimiter.to_string(), 
-                                    &indexnamevaluedelimiter.to_string(),
-                                    settings.enableviewdelete,
-                                    &mut file_len_map,
-                                    &mut file_size_map,
-                                    &mut file_mmap_map,
-                                    &mut file_line_map,
-                                    &mut file_key_pointer_map,);
+        let mut currentoffset:usize = 0;
+        let maxrecord: usize = 20000;
+        let mut currentrecordnum = 0;
+        let mut newrecordnum = 0;
+
+            let path = entry?.path();
+
+            if !(path.extension().and_then(|ext| ext.to_str()) == Some("jblox")) {
+                continue;
+            }
+
+            let mut offsetreturned: usize = 0;
+            let mut keeprunning : bool = true;
+
+            //get file name without extension
+            let file_name = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("UNKNOWN");
+            
+            while(keeprunning) { //'0' would mean that all records are processed
+                offsetreturned = load_existing_file(settings.initfilesize,
+                    settings.newfilesizemultiplier,
+                            &path.to_string_lossy().to_string(), 
+                                        &recorddelimiter.to_string(), 
+                                        &indexdelimiter.to_string(), 
+                                        &indexnamevaluedelimiter.to_string(),
+                                        settings.enableviewdelete,
+                                        settings.low_ram_mode,
+                                        settings.MADVISE_CHUNK,
+                                        size_digits,
+                                        settings.maxrecordlength,
+                                        maxrecord,
+                                        currentoffset,
+                                        &mut file_size_map,
+                                        &mut file_mmap_map,
+                                        &mut file_line_map,
+                                        &mut file_key_pointer_map,)?;
+
+                newrecordnum = file_line_map.get(file_name).unwrap().len();
+
+                currentoffset = file_size_map[file_name];
+
+                //if currentoffset == offsetreturned, no more records so break
+                println!("newrecordnum - currentrecordnum : {}, maxrecord: {}",newrecordnum -  currentrecordnum,maxrecord);
+                if((newrecordnum -  currentrecordnum) <  maxrecord){
+                    keeprunning = false;
+                }
+                else{
+                    currentrecordnum = newrecordnum;
+                }
+
+            }
+            let mut file_name_str = "";
+            if let Some(file_name) = path.file_stem() {
+                if let Some(s) = file_name.to_str() {
+                    file_name_str = s;
+                } else {
+                    println!("Non-UTF8 file name, using fallback.");
+                    file_name_str = "UNKNOWN";
+                }
+            } else {
+                println!("Skipping path with no filename: {:?}", path);
+            }
+
+            if let Some(lines) = file_line_map.get(file_name_str) {
+                println!("Total Number of records: {}",lines.len());
+
+            } else {
+                println!("No entry for {}", file_name_str);
+            }
 
         }
 
         let state = Arc::new(Mutex::new(SharedState {
             file_mmap_map,
         }));
-        print!("log dir: {}",logdir);
-        print!("datadir dir: {}",datadir);
+
+
+        println!("Ready to accept requests.");
         Ok(Self {settings,
-                file_len_map, 
                 file_size_map, 
                 file_line_map, 
                 file_key_pointer_map, 
@@ -556,138 +640,345 @@ impl jbothandler {
                 logdir, 
                 log_file,
                 log_line_count,
-                state,})
+                state,
+                size_digits,})
     }
 
-    pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timestamp: &str) -> std::io::Result<()> {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
-        use std::path::PathBuf;
-        use memmap2::MmapMut;
+    pub fn new() -> io::Result<Self> {
+        //get config file path
+        let config_path = get_config_path();
+        println!("Config file path: {}",config_path.to_str().unwrap());
+        let config = Config::builder()
+            .add_source(config::File::with_name(config_path.to_str().unwrap()))
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config build error: {}", e)))?;
 
-        let file_path = PathBuf::from(&self.datadir).join(format!("{}.jblox", file_name));
-        let updated_line = format!("00-{}:{}", timestamp, new_line);
-        let line_bytes = updated_line.as_bytes();
-        let line_len = line_bytes.len() + 1;
+        let mut settings: Settings = config
+            .try_deserialize()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config deserialize error: {}", e)))?;
 
+        //directory to be used to store data
+        let datadir = settings.datadir.clone();
+        //log directory
+        let logdir = settings.logdir.clone();
+        println!("log dir: {}",logdir);
+        println!("datadir dir: {}",datadir);
+    
+        //
+        //log frequency in hours
+        let logmaxlines: usize = settings.logmaxlines;
+        //indexnamevalue delimiter
+        let indexnamevaluedelimiter: char = settings.indexnamevaluedelimiter.clone().to_string().chars().next().unwrap_or('-'); //'-'
+        //index delimiter
+        let indexdelimiter: char = settings.indexdelimiter.clone().to_string().chars().next().unwrap_or('`');//'`'
+        //record delimiter
+        let recorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or(':');//':'
+
+        let repindexnamevaluedelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
+        let repindexdelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
+        let reprecorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
+        
+        //set size_digits 
+        let mut size_digits = 4; // minimum width
+        let max_length_digits = settings.maxrecordlength.to_string().len();
+
+        if max_length_digits >= 4 {
+            size_digits = max_length_digits + 1;
+        }
+
+        let mut log_line_count: usize = 0;
+
+        let log_filename = format!("{}/jblox.log", logdir);
+        println!("log_filename : {}",log_filename);
+        let log_file = BufWriter::new(
+            OpenOptions::new().create(true).append(true).open(&log_filename)?
+        );
+        let log_path = std::path::Path::new(&log_filename);
+        if log_path.exists() {
+            if let Ok(logfileforlines) = File::open(log_path) {
+                let reader = BufReader::new(logfileforlines);
+
+                log_line_count = reader.lines().count();
+            }
+        }
+
+        let mut file_size_map = HashMap::new();
+        let mut file_mmap_map = HashMap::new();
+        let mut file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>> = HashMap::new();
+        let mut file_key_pointer_map = HashMap::new();
+
+
+
+        for entry in std::fs::read_dir(datadir.clone())? {
+        let mut currentoffset:usize = 0;
+        let maxrecord: usize = 20000;
+        let mut currentrecordnum = 0;
+        let mut newrecordnum = 0;
+
+            let path = entry?.path();
+
+            if !(path.extension().and_then(|ext| ext.to_str()) == Some("jblox")) {
+                continue;
+            }
+
+            let mut offsetreturned: usize = 0;
+            let mut keeprunning : bool = true;
+
+            //get file name without extension
+            let file_name = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("UNKNOWN");
+            
+            while(keeprunning) { //'0' would mean that all records are processed
+                offsetreturned = load_existing_file(settings.initfilesize,
+                    settings.newfilesizemultiplier,
+                            &path.to_string_lossy().to_string(), 
+                                        &recorddelimiter.to_string(), 
+                                        &indexdelimiter.to_string(), 
+                                        &indexnamevaluedelimiter.to_string(),
+                                        settings.enableviewdelete,
+                                        settings.low_ram_mode,
+                                        settings.MADVISE_CHUNK,
+                                        size_digits,
+                                        settings.maxrecordlength,
+                                        maxrecord,
+                                        currentoffset,
+                                        &mut file_size_map,
+                                        &mut file_mmap_map,
+                                        &mut file_line_map,
+                                        &mut file_key_pointer_map,)?;
+
+                newrecordnum = file_line_map.get(file_name).unwrap().len();
+
+                currentoffset = file_size_map[file_name];
+
+                //if currentoffset == offsetreturned, no more records so break
+                println!("newrecordnum - currentrecordnum : {}, maxrecord: {}",newrecordnum -  currentrecordnum,maxrecord);
+                if((newrecordnum -  currentrecordnum) <  maxrecord){
+                    keeprunning = false;
+                }
+                else{
+                    currentrecordnum = newrecordnum;
+                }
+
+            }
+            let mut file_name_str = "";
+            if let Some(file_name) = path.file_stem() {
+                if let Some(s) = file_name.to_str() {
+                    file_name_str = s;
+                } else {
+                    println!("Non-UTF8 file name, using fallback.");
+                    file_name_str = "UNKNOWN";
+                }
+            } else {
+                println!("Skipping path with no filename: {:?}", path);
+            }
+
+            if let Some(lines) = file_line_map.get(file_name_str) {
+                println!("Total Number of records: {}",lines.len());
+
+            } else {
+                println!("No entry for {}", file_name_str);
+            }
+
+        }
+
+        let state = Arc::new(Mutex::new(SharedState {
+            file_mmap_map,
+        }));
+
+
+    println!("Ready to accept requests.");
+        Ok(Self {settings,
+                file_size_map, 
+                file_line_map, 
+                file_key_pointer_map, 
+                datadir, 
+                logdir, 
+                log_file,
+                log_line_count,
+                state,
+                size_digits,})
+    }
+
+pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timestamp: &str) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+    use memmap2::MmapMut;
+
+    let file_path = PathBuf::from(&self.datadir).join(format!("{}.jblox", file_name));
+
+    // Format the full updated line with placeholder size for now
+    let placeholder_size_str = "0".repeat(self.size_digits);
+    let mut updated_line = format!("00-{timestamp}`{placeholder_size_str}:{new_line}\n");
+
+    // Encode updated_line to UCS-2 to get actual byte length
+    let ucs2_data: Vec<u16> = updated_line.chars()
+        .map(|c| if c as u32 <= 0xFFFF { c as u16 } else { '?' as u16 })
+        .collect();
+    let line_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            ucs2_data.as_ptr() as *const u8,
+            ucs2_data.len() * 2,
+        )
+    };
+    let total_size = line_bytes.len();
+
+    // Now update size_str in updated_line with actual size
+    let size_str = format!("{:0width$}", total_size, width = self.size_digits);
+    updated_line = format!("00-{timestamp}`{size_str}:{new_line}\n");
+
+    // Re-encode updated_line with correct size
+    let ucs2_data: Vec<u16> = updated_line.chars()
+        .map(|c| if c as u32 <= 0xFFFF { c as u16 } else { '?' as u16 })
+        .collect();
+    let line_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            ucs2_data.as_ptr() as *const u8,
+            ucs2_data.len() * 2,
+        )
+    };
+    let line_len = line_bytes.len();
+
+    let record_delim = self.settings.recorddelimiter.to_string();
+    let index_delim = self.settings.indexdelimiter.to_string();
+    let indexnamevalue_delim = self.settings.indexnamevaluedelimiter.to_string();
+
+    {
         let mut state = self.state.lock().unwrap();
-        let mut file_mmap_map_t = &mut state.file_mmap_map;
-        // Step 1: If mmap not initialized, initialize mapping and metadata
+        let file_mmap_map_t = &mut state.file_mmap_map;
+
         if !file_mmap_map_t.contains_key(file_name) {
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .open(&file_path)?;
+            println!("initfilesize: {}", self.settings.initfilesize);
+            let newfilesize = self.settings.initfilesize * 1_000_000.0;
+            file.set_len(newfilesize as u64)?;
 
-                load_existing_file(self.settings.initfilesize,
+            load_existing_file(
+                self.settings.initfilesize,
                 self.settings.newfilesizemultiplier,
-                          &file_path.to_string_lossy().to_string(), 
-                                    &self.settings.recorddelimiter.to_string(), 
-                                    &self.settings.indexdelimiter.to_string(), 
-                                    &self.settings.indexnamevaluedelimiter.to_string(),
-                                    self.settings.enableviewdelete,
-                                    &mut self.file_len_map,
-                                    &mut self.file_size_map,
-                                    &mut file_mmap_map_t,
-                                    &mut self.file_line_map,
-                                    &mut self.file_key_pointer_map,);
-
+                &file_path.to_string_lossy(),
+                &record_delim,
+                &index_delim,
+                &indexnamevalue_delim,
+                self.settings.enableviewdelete,
+                self.settings.low_ram_mode,
+                self.settings.MADVISE_CHUNK,
+                self.size_digits,
+                self.settings.maxrecordlength,
+                0,
+                0,
+                &mut self.file_size_map,
+                file_mmap_map_t,
+                &mut self.file_line_map,
+                &mut self.file_key_pointer_map,
+            );
         }
-        //file actual size
-        let fileactualsize = *self.file_size_map.get(file_name).unwrap();
-        let allowedfilesize = *self.file_len_map.get(file_name).unwrap();
-        
-        let ratio = fileactualsize as f64/allowedfilesize as f64;
+    }
 
-        let decimal_part = (ratio.fract() * 100.0).round() / 100.0;
+    let mut state = self.state.lock().unwrap();
+    let file_mmap_map_t = &mut state.file_mmap_map;
+    let mmap = file_mmap_map_t.get_mut(file_name).unwrap();
+    let start = *self.file_size_map.get_mut(file_name).unwrap();
+    let end = start + line_len;
+    if end > mmap.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Write exceeds mmap size",
+        ));
+    }
 
-        // Step 3: Write using mmap
-        let mmap = file_mmap_map_t.get_mut(file_name).unwrap();
-        let start = *self.file_size_map.get_mut(file_name).unwrap();
-        let end = start + line_bytes.len();
-        if end > mmap.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Write exceeds mmap size"));
-        }
-        mmap[start..end].copy_from_slice(line_bytes);
-        mmap[end] = b'\n';
-        *self.file_size_map.get_mut(file_name).unwrap() += line_len;
+    mmap[start..end].copy_from_slice(line_bytes);
 
-        //increment the file size in 
-        let new_ptr = PtrWrapper::new(unsafe { mmap.as_mut_ptr().add(start) });
-        self.file_line_map.get_mut(file_name).unwrap().push(new_ptr.clone());
+    *self.file_size_map.get_mut(file_name).unwrap() += line_len;
 
+    let new_ptr = PtrWrapper::new(unsafe { mmap.as_mut_ptr().add(start) });
+    let new_record_len = line_len;
+    self.file_line_map.get_mut(file_name).unwrap().push((new_ptr.clone(), new_record_len));
 
-        // Step 4: Extract keys and update map
-        if let Some(key_map) = self.file_key_pointer_map.get_mut(file_name) {
-            let mut parts = updated_line.splitn(3, self.settings.recorddelimiter);
-            parts.next(); // skip timestamp
-            if let Some(key) = parts.next() {
-                for part in key.trim().split(self.settings.indexdelimiter) {
-                    if let Some(dash_pos) = part.find(self.settings.indexnamevaluedelimiter) {
-                        let key_name = &part[..dash_pos];
-                        let key_value = &part[dash_pos + 1..];
-
-                        key_map
-                            .entry(key_name.to_string())
-                            .or_default()
-                            .entry(key_value.to_string())
-                            .or_default()
-                            .push(new_ptr.clone());
-                    }
+    if let Some(key_map) = self.file_key_pointer_map.get_mut(file_name) {
+        let mut parts = updated_line.splitn(3, record_delim.as_str());
+        parts.next();
+        if let Some(key) = parts.next() {
+            for part in key.trim().split(index_delim.as_str()) {
+                if let Some(dash_pos) = part.find(indexnamevalue_delim.as_str()) {
+                    let key_name = &part[..dash_pos];
+                    let key_value = &part[dash_pos + 1..];
+                    key_map.entry(key_name.to_string()).or_default()
+                        .entry(key_value.to_string()).or_default()
+                        .push(new_ptr.clone());
                 }
             }
         }
-        if(decimal_part > 0.98){
-            //end process for the integrity of the database
-                eprintln!("⚠️  ERROR: data file size {}%, stopping jbloxbd.",decimal_part*100.00);
-                process::exit(0); // Exit with status code 0 (success)
-        }
-        else if(decimal_part > 0.85){
-            //send waring to the admin to restart for remapping
-            eprintln!("⚠️  Warning data file size {}%, restart jbloxdb to increase allowed size.",decimal_part*100.00);
-            eprintln!("⚠️  Warning data file size {}%, Process will stop automatically when file size reaches 98%.",decimal_part*100.00);
-        }  
-        Ok(())
     }
 
-    pub fn print_line_by_pointer(&self, file_name: &str, ptrw: PtrWrapper) {
-        let mut state = self.state.lock().unwrap();
-        let mut file_mmap_map_t = &mut state.file_mmap_map;
-        let ptr = ptrw.as_ptr();
-        if let (Some(lines), Some(mmap), Some(&len)) = (
-            self.file_line_map.get(file_name),
-            file_mmap_map_t.get(file_name),
-            self.file_len_map.get(file_name)
-        ) {
-            let idx = lines.binary_search_by(|w| unsafe {
-                let p = w.as_ptr();
-                if p <= ptr { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
-            }).unwrap_or_else(|i| i);
-            let start = ptr;
-            let end = if idx+1 < lines.len() {
-                lines[idx+1].as_ptr()
+    let ratio = end as f64 / mmap.len() as f64;
+    let decimal_part = (ratio.fract() * 100.0).round() / 100.0;
+    if decimal_part > 0.95 {
+        eprintln!("⚠️  ERROR: data file size {}%, stopping jbloxdb.", decimal_part * 100.0);
+        process::exit(0);
+    } else if decimal_part > 0.85 {
+        eprintln!("⚠️  Warning data file size {}%, restart jbloxdb to increase allowed size.", decimal_part * 100.0);
+        eprintln!("⚠️  Warning data file size {}%, Process will stop automatically when file size reaches 98%.", decimal_part * 100.0);
+    }
+
+    Ok(())
+}
+
+
+pub fn print_line_forpointer(&self, start_ptr: PtrWrapper, includedelete: bool) -> std::io::Result<String> {
+    let max_len: usize = self.settings.maxrecordlength;
+    let mut u16_buffer = Vec::new();
+
+    for i in 0..max_len {
+        unsafe {
+            let byte1 = *start_ptr.add(i * 2);
+            let byte2 = *start_ptr.add(i * 2 + 1);
+            let u16_char = u16::from_le_bytes([byte1, byte2]);
+
+            if u16_char == b'\n' as u16 {
+                let line = String::from_utf16(&u16_buffer).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+
+                if includedelete && self.settings.enableviewdelete {
+                    return Ok(line);
+                } else if line.starts_with("00") {
+                    return Ok(line);
+                } else {
+                    return Ok("".to_string());
+                }
             } else {
-                unsafe { mmap.as_ptr().add(len) as *mut u8 }
-            };
-            let slice = unsafe { std::slice::from_raw_parts(start, end.offset_from(start) as usize) };
-            if let Ok(text) = std::str::from_utf8(slice) {
-                println!("Line: {}", text.trim_end_matches('\n'));
+                u16_buffer.push(u16_char);
             }
         }
     }
 
-    pub fn print_between(&self, start_ptr: *mut u8, end_ptr: *mut u8) {
-        let len = unsafe { end_ptr.offset_from(start_ptr) as usize };
-        let slice = unsafe { std::slice::from_raw_parts(start_ptr as *const u8, len) };
+    if !u16_buffer.is_empty() {
+        let line = String::from_utf16(&u16_buffer).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
 
-        match std::str::from_utf8(slice) {
-            Ok(text) => println!("Text between: {}", text),
-            Err(_) => eprintln!("Invalid UTF-8 between pointers"),
+        if line.starts_with("00") {
+            return Ok(line);
         }
     }
 
-    pub fn print_line_forpointer(&self, start_ptr: PtrWrapper, includedelete: bool) -> std::io::Result<String> {
+    Ok("".to_string())
+}
+
+
+
+
+////////////////////////////////////////////////////////////////// 
+
+
+    pub fn print_line_forpointer_v01(&self, start_ptr: PtrWrapper, includedelete: bool) -> std::io::Result<String> {
         let max_len: usize = self.settings.maxrecordlength;
         let mut bytes = Vec::new();
 
@@ -1063,6 +1354,8 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             unsafe {
                 // Overwrite first byte at the pointer
                 *ptr = b'2'; // Null byte if preferred
+                *ptr.add(1) = 0x00;  // for ucs-2 compatibility
+
             }
         } else {
             eprintln!("No mmap found for file '{}'", file_name);
@@ -1080,6 +1373,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             unsafe {
                 // Overwrite first byte at the pointer
                 *ptr = b'1'; // Null byte if preferred
+                *ptr.add(1) = 0x00;  // for ucs-2 compatibility
             }
         } else {
             eprintln!("No mmap found for file '{}'", file_name);
@@ -1364,7 +1658,11 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             result.sort_by_key(|ptr| ptr.as_ptr() as usize);
         }
 
-        let mut result_lines: Vec<String> = Vec::with_capacity(self.settings.maxgetrecords);
+        let mut result_lines: Vec<String> = Vec::with_capacity(self.settings.maxgetrecords + 1);
+        //add meta data
+        let total_records = result.len(); // your value
+        let meta_json_str = format!(r#"{{"meta":{{"total_count":{}}}}}"#, total_records);
+        result_lines.push(meta_json_str.clone());
 
         for ptr in result {
             if result_lines.len() >= self.settings.maxgetrecords {

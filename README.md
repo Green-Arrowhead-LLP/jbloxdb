@@ -1,4 +1,4 @@
-jbloxDB [⬇️ Download Latest Release](https://github.com/Green-Arrowhead-LLP/jbloxdb/releases/latest)
+jbloxDB
 --------
 
 A zero-metadata configuration, high-performance JSON data management system developed in Rust.
@@ -20,6 +20,7 @@ Key Features:
 - Text-based data storage files
 - Open source
 - Rust-native performance
+- Full UCS-2 support
 
 --------
 
@@ -56,8 +57,14 @@ jbloxDB uses JSON for all request and response formats.
 
 ### ⚙ Operation Details:
 
-- **get**: Fetches records matching all keys (AND logic); paginated via `recstart`
+- **get**: Fetches records matching all keys (AND logic); paginated via `recstart`*
 - **getall**: Fetches records matching any of the keys (OR logic)
+- **gethist**: Fetches records' history i.e. all records: deleted or updated, matching all keys (AND logic)
+- **gethistall**: Fetches records' history i.e. all records: deleted or updated, matching any of the keys (OR logic)
+- **getdesc**: Fetches records, in descending order, matching all keys (AND logic)
+- **getalldesc**: Fetches records, in descending order, matching any of the keys (OR logic)
+- **gethist**: Fetches records' history i.e. all records: deleted or updated, in descending order,  matching all keys (AND logic)
+- **gethistalldesc**: Fetches records' history i.e. all records: deleted or updated, in descending order, matching any of the keys (OR logic)
 - **insert**: Inserts a new JSON record; duplicates not allowed
 - **insertduplicate**: Inserts even if a record with matching keys already exists
 - **update**: Marks old record as deleted, then inserts new one (requires full record)
@@ -65,6 +72,7 @@ jbloxDB uses JSON for all request and response formats.
 - **delete**: Marks the latest matching record as deleted
 - **deleteall**: Deletes all matching records
 
+*pagination via `recstart` is available to all 'get' requests
 --------
 
 Data Storage:

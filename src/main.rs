@@ -26,6 +26,10 @@ use serde::Deserialize;
 
 use std::io::{self, Error, ErrorKind};
 
+use std::sync::{atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::time::Duration;
+
 #[derive(Clone,Debug, Deserialize)]
 struct Settings {
     ip: String,
@@ -40,6 +44,20 @@ struct Settings {
 
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
+    //check .lck file so at to make sure that only on instance is running
+    // Check for jblox.lck file
+    let lock_file_path = Path::new(".").join("jblox.lck");
+    if lock_file_path.exists() {
+        eprintln!("jblox.lck found in data directory. Another instance might be running.");
+        process::exit(1);
+    }
+    // Create lock file
+    fs::write(&lock_file_path, "locked").map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("Failed to create lock file: {}", e))
+    })?;    
+
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutting_down.clone();
 
     let config_path = get_config_path();
     println!("Config file path for jbloxdb http wrapper: {}",config_path.to_str().unwrap());
@@ -59,10 +77,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind the TCP listener to localhost at port 3000
     let listener = TcpListener::bind(format!("{}:{}", settings.ip, settings.port)).await?;
+    
+    let shutdown_checker = shutdown_clone.clone();
 
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(60)); // Check every 1 min
+
+            let stop_file = std::path::Path::new(".").join("jblox.stop");
+            if stop_file.exists() {
+                println!("Detected jbloxdb.stop file. Initiating shutdown...");
+
+                shutdown_checker.store(true, Ordering::SeqCst);
+
+                println!("Waiting 10 seconds for active requests to finish...");
+                thread::sleep(Duration::from_secs(10));
+
+                println!("Cleaning up lock and stop files...");
+                let lock_file = std::path::Path::new(".").join("jblox.lck");
+
+                if lock_file.exists() {
+                    if let Err(e) = fs::remove_file(&lock_file) {
+                        eprintln!("Failed to delete jblox.lck: {}", e);
+                    } else {
+                        println!("Deleted jblox.lck");
+                    }
+                }
+
+                if let Err(e) = fs::remove_file(&stop_file) {
+                    eprintln!("Failed to delete jbloxdb.stop: {}", e);
+                } else {
+                    println!("Deleted jbloxdb.stop");
+                }
+
+                println!("Shutdown complete. Exiting.");
+                std::process::exit(0);
+            }
+        }
+    });
 
     // Accept incoming connections in an infinite loop
     loop {
+
+        if shutting_down.load(Ordering::SeqCst) {
+            println!("Shutting down. Not accepting new connections.");
+            return Ok(());
+        }
+
         let handler = Arc::clone(&handler);
 
         // Accept a new TCP connection

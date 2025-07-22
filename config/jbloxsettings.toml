@@ -9,7 +9,7 @@
 #initial file size (in MBs), file size of data file (used to store data)
 #that you expect not to out grow soon. You will have to restart
 #jbloxDB if file size is reached. jbloxDB might restart on its own
-#if jbloxDB is not started by the admin. (current default to 100 MB)
+#if jbloxDB is not started by the admin. 
 initfilesize = 1 
 
 #once file size reaches initfilesize, jbloxDB increases size by this
@@ -27,7 +27,7 @@ logdir = "./log"
 maxgetrecords = 100
 
 #maximum length of record
-maxrecordlength = 40960
+maxrecordlength = 327680
 
 #max number of lines in log file before creating a new one
 #'0' indicates do not recreate ever.
@@ -54,8 +54,18 @@ repindexdelimiter = "_"
 #used by jbloxdb, they will be replace by the following
 reprecorddelimiter = "_"
 
+
 #feature enables to view deleted records if they exist in the file
-enableviewdelete = false
+enableviewdelete = true
 
 #max length of string to print on console for log
 maxlogtoconsolelength = 100
+
+#For Future Versions, not used currently
+#configuration for mmap : OS intructions (only in unix/linux based OS)
+#windows does it automatically
+#
+#in GB
+MADVISE_CHUNK = 4
+#enable only when following flag is true
+low_ram_mode = false

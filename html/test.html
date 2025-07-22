@@ -1,77 +1,247 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Screenshot Viewer</title>
+  <meta charset="UTF-8" />
+  <title>Send JSON to Rust Server</title>
+  <style>
+    textarea {
+      width: 100%;
+      height: 200px;
+      margin-top: 10px;
+      font-family: monospace;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px;
+      border: 1px solid #ccc;
+    }
+    .active-start {
+      background-color: #28a745;
+      color: white;
+    }
+    .active-stop {
+      background-color: #dc3545;
+      color: white;
+    }
+    img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      margin-top: 10px;
+    }
+    #imageContainer {
+      overflow: auto;
+      max-height: none;
+      max-width: none;
+    }
+  </style>
 </head>
 <body>
-    <h1>Screenshot Viewer</h1>
-    <button onclick="fetchScreenshot()">Fetch Screenshot</button>
-    <div id="image-container" style="margin-top: 20px;">
-        <img id="screenshot" alt="Screenshot will appear here" style="max-width: 100%; height: auto;"/>
-    </div>
-    <pre id="log" style="background: #eee; padding: 10px; margin-top: 20px;"></pre>
+  <h2>Send JSON to Rust Server</h2>
 
-    <script>
-        async function fetchScreenshot() {
-            const log = document.getElementById('log');
-            log.textContent = "Fetching screenshot...";
+  <label><b>Select JSON file:</b></label><br>
+  <input type="file" id="jsonFile" accept=".json" />
+  <br><br>
 
-            try {
-                const response = await fetch('/submit', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        op: "get",
-                        data: {
-                            key: "id",
-                            keyobj: "screenshot",
-                            id: "20250710170426181491"
-                        }
-                    })
-                });
+  <label><b>Or paste JSON here:</b></label><br>
+  <textarea id="jsonText">
+{
+  "op": "get",
+  "data": {
+    "key": "id,name,email",
+    "keyobj": "user",
+    "id": "user12345",
+    "name": "Alice James",
+    "email": "alice@example.com",
+    "phone": "+1-555-1234",
+    "address": "123 Main St, Springfield",
+    "dob": "1990-05-15",
+    "profile": {
+      "bio": "Software engineer with a passion for scalable systems and coffee.",
+      "website": "https://alicejames.dev",
+      "social": {
+        "twitter": "@alicej",
+        "linkedin": "linkedin.com/in/alicejames",
+        "github": "github.com/alicej"
+      },
+      "preferences": {
+        "language": "en-US",
+        "timezone": "America/New_York",
+        "notifications": {
+          "email": true,
+          "sms": false,
+          "push": true
+        },
+        "theme": "dark"
+      }
+    },
+    "security": {
+      "2fa_enabled": true,
+      "last_login": "2025-07-15T10:22:30Z",
+      "login_attempts": 3
+    },
+    "history": [
+      {
+        "login": "2025-07-10T09:15:20Z",
+        "ip": "192.168.1.10",
+        "device": "Chrome on Windows"
+      },
+      {
+        "login": "2025-07-08T14:05:55Z",
+        "ip": "192.168.1.22",
+        "device": "Firefox on macOS"
+      }
+    ],
+    "metadata": {
+      "created_at": "2023-04-01T12:00:00Z",
+      "updated_at": "2025-07-15T10:22:30Z",
+      "tags": ["admin", "beta-tester", "premium-user"]
+    },
+    "extra": {
+      "notes": "This user is part of the early access program. Provide priority support.",
+      "flags": {
+        "vip": true,
+        "restricted": false,
+        "beta_features": true
+      }
+    },
+    "logs": [
+      {"event": "password_change", "time": "2025-06-01T13:33:00Z"},
+      {"event": "email_update", "time": "2025-05-15T08:20:00Z"},
+      {"event": "2fa_enabled", "time": "2025-04-10T11:45:00Z"}
+    ]
+  }
+}
 
-                const result = await response.json();
-                log.textContent = "Server response:\n" + JSON.stringify(result, null, 2);
+  </textarea>
+  <br>
 
-                const rec1Str = result.data.Rec1;
-                log.textContent += "\n\nExtracted Rec1:\n" + rec1Str.substring(0, 300) + "...";
+  <label><input type="checkbox" id="randomName"> Generate random name</label>
+  <br><br>
 
-                // Find "file":" in Rec1
-                const fileKey = '"file":"';
-                const base64StartIdx = rec1Str.indexOf(fileKey);
-                if (base64StartIdx === -1) {
-                    throw new Error('Could not find "file":" in Rec1');
-                }
+  <button onclick="uploadJson()">Send to Server</button>
+  <br>
+  <label><b>Interval (ms):</b></label>
+  <input type="number" id="interval" value="1000" min="100" step="100">
+  <br><br>
+  <button id="startBtn" onclick="startAutoSend()">Start Auto Send</button>
+  <button id="stopBtn" onclick="stopAutoSend()">Stop</button>
 
-                const imgStart = base64StartIdx + fileKey.length;
-                const imgEnd = rec1Str.indexOf('"', imgStart);
-                if (imgEnd === -1) {
-                    throw new Error('Could not find closing quote for Base64 image string');
-                }
+  <h3>Server Response:</h3>
+  <pre id="responseBox"></pre>
+  <div id="imageContainer"></div>
 
-                const base64Data = rec1Str.substring(imgStart, imgEnd);
-                log.textContent += "\n\nBase64 image data starts with:\n" + base64Data.slice(0, 50);
+  <script>
+    let autoSendInterval = null;
 
-                if (!base64Data.startsWith("data:image/")) {
-                    throw new Error("Invalid Base64 prefix: " + base64Data.slice(0, 30));
-                }
+    function generateRandomName() {
+      const randomPart = Math.random().toString(36).substring(2, 8).toUpperCase();
+      return `User-${randomPart}`;
+    }
 
-                // Render the image
-                const img = document.getElementById('screenshot');
-                img.src = base64Data;
+    function extractBase64Image(text) {
+      const base64Regex = /data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/;
+      const match = base64Regex.exec(text);
+      return match ? match[0] : null;
+    }
 
-                log.textContent += "\n\nImage rendered successfully.";
+    async function uploadJson() {
+      const fileInput = document.getElementById("jsonFile");
+      const textarea = document.getElementById("jsonText");
+      const responseBox = document.getElementById("responseBox");
+      const imageContainer = document.getElementById("imageContainer");
+      const randomNameCheckbox = document.getElementById("randomName");
+      imageContainer.innerHTML = ""; // Clear any previous image
 
-            } catch (err) {
-                log.textContent += "\n\nError: " + err.message;
-                console.error(err);
-            }
+      let jsonData = null;
+
+      // Try file input first
+      if (fileInput.files.length > 0) {
+        const file = fileInput.files[0];
+        const text = await file.text();
+        try {
+          jsonData = JSON.parse(text);
+        } catch (err) {
+          responseBox.textContent = "Invalid JSON in file.";
+          return;
+        }
+      } else if (textarea.value.trim()) {
+        try {
+          jsonData = JSON.parse(textarea.value.trim());
+        } catch (err) {
+          responseBox.textContent = "Invalid JSON in textarea.";
+          return;
+        }
+      } else {
+        responseBox.textContent = "Please select a file or paste JSON.";
+        return;
+      }
+
+      // If random name checkbox is checked, generate and replace 'name'
+      if (randomNameCheckbox.checked && jsonData?.data?.name) {
+        jsonData.data.name = generateRandomName();
+        textarea.value = JSON.stringify(jsonData, null, 2); // Update textarea
+      }
+
+      try {
+        const res = await fetch("/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(jsonData),
+        });
+
+        const resText = await res.text();
+        try {
+          const parsed = JSON.parse(resText);
+          responseBox.textContent = `Server response (formatted):\n${JSON.stringify(parsed, null, 2)}`;
+        } catch {
+          responseBox.textContent = `Server response:\n${resText}`;
         }
 
-        window.fetchScreenshot = fetchScreenshot; // Expose globally
-    </script>
+        // Check for Base64 image in response
+        const base64Image = extractBase64Image(resText);
+        if (base64Image) {
+          const img = document.createElement("img");
+          img.src = base64Image;
+          img.alt = "Extracted Image";
+          img.style.maxWidth = "100%";
+          img.style.maxHeight = "100vh";
+          img.style.display = "block";
+          img.style.marginTop = "10px";
+          imageContainer.innerHTML = "";
+          imageContainer.appendChild(img);
+        }
+      } catch (err) {
+        responseBox.textContent = `Failed to send request:\n${err}`;
+      }
+    }
+
+    function updateButtonStyles(isRunning) {
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      if (isRunning) {
+        startBtn.classList.add("active-start");
+        stopBtn.classList.remove("active-stop");
+      } else {
+        startBtn.classList.remove("active-start");
+        stopBtn.classList.add("active-stop");
+      }
+    }
+
+    function startAutoSend() {
+      const intervalMs = parseInt(document.getElementById("interval").value, 10) || 1000;
+      if (autoSendInterval) clearInterval(autoSendInterval);
+      autoSendInterval = setInterval(uploadJson, intervalMs);
+      updateButtonStyles(true);
+    }
+
+    function stopAutoSend() {
+      if (autoSendInterval) {
+        clearInterval(autoSendInterval);
+        autoSendInterval = null;
+      }
+      updateButtonStyles(false);
+    }
+  </script>
 </body>
 </html>

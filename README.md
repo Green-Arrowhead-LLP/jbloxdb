@@ -21,6 +21,7 @@ Key Features:
 - Open source
 - Rust-native performance
 - Full UCS-2 support
+- All requests and responses in JSON formats.
 
 --------
 
@@ -32,7 +33,37 @@ GitHub:   `https://github.com/Green-Arrowhead-LLP/jbloxdb`
 
 Usage:
 
-jbloxDB uses JSON for all request and response formats.
+### Start jbloxDB:
+
+(everytime jbloxDB runs, it creates jblox.lck file, at the same location as jbloxdb executable,
+to make sure only one instance is running at any given point of time. 
+So, before running jbloxDB make sure there are 
+no other instances of jbloxdb running, and remove jblox.lck if you need to.)
+
+Microsoft Window:
+Prerequisite: 
+1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml,
+exists at the same location as jbloxdb.exe .(if config directory is not found, jbloxDB will
+check the parent directory, and so on, till it reaches base directory)
+2. Make sure data; log; html directories mentioned in the toml files exist.
+
+Execute: jbloxdb.exe 
+
+Linux/Linux based OS
+
+1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml,
+exists at the same location as jbloxdb . (if config directory is not found, jbloxDB will
+check the parent directory, and so on, till it reaches base directory)
+2. Make sure data; log; html directories mentioned in the toml files exist.
+
+Execute: ./jbloxdb
+
+### Stop jbloxDB:
+
+jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, every 60 seconds. 
+If file exists, jbloxDB will stop taking any new http requests and wait for 10 seconds to shutdown 
+jbloxDB.
+
 
 ### 📘 Request Format:
 

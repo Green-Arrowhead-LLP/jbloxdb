@@ -94,7 +94,7 @@ jbloxDB.
 - **gethistall**: Fetches records' history i.e. all records: deleted or updated, matching any of the keys (OR logic)
 - **getdesc**: Fetches records, in descending order, matching all keys (AND logic)
 - **getalldesc**: Fetches records, in descending order, matching any of the keys (OR logic)
-- **gethist**: Fetches records' history i.e. all records: deleted or updated, in descending order,  matching all keys (AND logic)
+- **gethistdesc**: Fetches records' history i.e. all records: deleted or updated, in descending order,  matching all keys (AND logic)
 - **gethistalldesc**: Fetches records' history i.e. all records: deleted or updated, in descending order, matching any of the keys (OR logic)
 - **insert**: Inserts a new JSON record; duplicates not allowed
 - **insertduplicate**: Inserts even if a record with matching keys already exists

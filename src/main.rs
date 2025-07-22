@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let stop_file = std::path::Path::new(".").join("jblox.stop");
             if stop_file.exists() {
-                println!("Detected jbloxdb.stop file. Initiating shutdown...");
+                println!("Detected jblox.stop file. Initiating shutdown...");
 
                 shutdown_checker.store(true, Ordering::SeqCst);
 
@@ -105,9 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Err(e) = fs::remove_file(&stop_file) {
-                    eprintln!("Failed to delete jbloxdb.stop: {}", e);
+                    eprintln!("Failed to delete jblox.stop: {}", e);
                 } else {
-                    println!("Deleted jbloxdb.stop");
+                    println!("Deleted jblox.stop");
                 }
 
                 println!("Shutdown complete. Exiting.");

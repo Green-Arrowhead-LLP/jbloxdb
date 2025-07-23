@@ -1,0 +1,44 @@
+# jbloxDB
+# © 2025 Green Arrowhead LLP
+# Licensed under the jbloxDB License v1.0
+# See LICENSE.txt for terms.
+# Free for individuals and small companies.
+# Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
+
+[package]
+name = "jbloxEditor"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "jbloxEditor"
+path = "src/jbloxEditor.rs"
+
+[dependencies]
+#
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.21"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+#
+#till here
+#
+#
+quick-xml = { version = "0.31", features = ["encoding","serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
+csv = "1.3"
+xmltree = "0.10"
+encoding_rs = "0.8"
+memmap2 = "0.9"
+atoi = "0.4"
+lexical-core = "0.8"
+wide = "0.7"
+#
+# extra for text editor
+clap = "4.4"            # For CLI args
+crossterm = "0.27"      # Optional for nicer text UI
+#
+
+

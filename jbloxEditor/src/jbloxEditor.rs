@@ -242,13 +242,19 @@ fn index_lines_batch(
 }
 
 
-fn print_header(h_offset: usize, v_offset: usize, view_height: usize, stdout: &mut Stdout) {
+fn print_header(h_offset: usize, v_offset: usize, view_width: usize, view_height: usize, stdout: &mut Stdout) {
     execute!(stdout, MoveTo(0, 0));
     // Top status line
     queue!(stdout, MoveTo(0, 0), Print("JBlox Editor"));
 
     // Second help line
-    queue!(stdout, MoveTo(0, 1), Print("Arrows: ↑↓↔ |PgUp/PgDn |Ctrl+↑↓↔ |Ctrl+S |Ctrl+z |Ctrl+g |Ctrl+q"));
+    let controlsstr: String 
+        = "Arrows: ↑↓↔ |Ctrl+p/Alt+p |Ctrl+f/Ctrl+l|Alt+f/Alt+l |Ctrl+S |Ctrl+z |Ctrl+g |Ctrl+q"
+        .to_string()
+        .chars()
+        .take(view_width-2)
+        .collect();
+    queue!(stdout, MoveTo(0, 1), Print(controlsstr));
 }
 
 
@@ -305,6 +311,22 @@ fn main() -> io::Result<()> {
                 .required(false)
                 .num_args(1)
                 .help("rollback-lines for indexing lines (default: 1000)"),
+        )
+        .arg(
+            Arg::new("protected-chars")
+                .short('p')
+                .long("protected-chars")
+                .value_name("CHARS")
+                .required(false)
+                .help("Comma-separated list of protected characters (default: ':,`,-')")
+        )
+        .arg(
+            Arg::new("separator-char")
+                .short('s')
+                .long("separator-char")
+                .value_name("CHAR")
+                .required(false)
+                .help("Single character used as separator (default: ':')")
         ).get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
@@ -321,7 +343,17 @@ fn main() -> io::Result<()> {
         .get_one::<String>("char-size")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(2);
-    
+
+    let protected_chars_arg: Vec<char> = matches
+        .get_one::<String>("protected-chars")
+        .map(|s| s.chars().filter(|c| *c != ',').collect())
+        .unwrap_or_else(|| vec![':', '`', '-']);
+
+    let recsepratorforlen_arg: char = matches
+        .get_one::<String>("separator-char")
+        .and_then(|s| s.chars().next())
+        .unwrap_or(':');
+
     //max size for below decided by rollback_lines
     let mut rollback_orig_line_map: HashMap<usize, String> = HashMap::new();
     let mut rollback_insert_tracker: Vec<usize> = Vec::with_capacity(rollback_lines);
@@ -343,7 +375,7 @@ fn main() -> io::Result<()> {
         }
     };
     let protected_chars: Vec<char> = if file_name.contains(".jblox") {
-        vec![':', '`', '-'] // Example protected chars
+        protected_chars_arg
     } else {
         vec![] // No restrictions
     };
@@ -360,7 +392,7 @@ fn main() -> io::Result<()> {
         .write(true)
         .open(&history_file_path)?;
 
-    let recsepratorforlen = ':';
+
     // Offsets for scrolling
     let mut offset: u64 = 0;
     let mut v_offset: usize = 0; // Vertical scroll offset
@@ -431,7 +463,7 @@ let draw_visible_lines_v3 = |
     view_height: usize
 | -> std::io::Result<()> {
 
-    print_header(h_offset, v_offset, view_height, stdout);
+    print_header(h_offset, v_offset,view_width , view_height, stdout);
 
     // Draw visible lines
     for (i, mut line) in window_lines.iter().enumerate()
@@ -657,7 +689,7 @@ for row in 0..view_height {
         {
             if kind == KeyEventKind::Press {
                 match (code, modifiers) {
-                    (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('f'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                     cursor.col = 0;
                     cursor.row = 0;
 
@@ -758,7 +790,7 @@ for row in 0..view_height {
 
 
                     }
-                    (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                         let ptrmaplen = line_ptr_map.len();
                         for row in 0..view_height {
                             ui_line_map.insert(row, ptrmaplen + row - view_height); // screen row 0 maps to file line 0, etc.
@@ -856,7 +888,7 @@ for row in 0..view_height {
                                         &mut stdout,
                                         view_height.clone())?; 
                     }
-                    (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('f'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                         h_offset = 0;
                         cursor.col = 0;
                         draw_visible_lines_v3( &ui_line_map,
@@ -915,7 +947,7 @@ for row in 0..view_height {
                                         &mut stdout,
                                         view_height.clone())?;                        
                     }
-                    (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                     let current_line = &window_lines[cursor.row];
 
                     // 🔥 Use length of current_line directly as displayed char count
@@ -974,7 +1006,7 @@ for row in 0..view_height {
 
 
 
-                    (KeyCode::PageUp, _) =>{
+                    (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) =>{
                     let mut firstrec = ui_line_map[&0];
                     let mut tobeshifted = view_height;
                     if firstrec < view_height {
@@ -1019,7 +1051,7 @@ for row in 0..view_height {
                                         view_height.clone())?;   
                     }
 
-                    (KeyCode::PageDown, _) => {
+                    (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
 
                     let uilength: usize = ui_line_map.len();
                     let lastrec = ui_line_map[&(uilength - 1)];
@@ -1320,7 +1352,7 @@ for row in 0..view_height {
                         let editable = is_editable(
                             &orig_line_text,
                             file_col,
-                            recsepratorforlen,
+                            recsepratorforlen_arg,
                             file_name.contains(".jblox"),
                         );
 

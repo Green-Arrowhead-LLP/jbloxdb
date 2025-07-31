@@ -14,7 +14,6 @@ port = "3000"
 #request buffer size
 maxbuffer = 2097152
 
-
 #html directory
 htmldir = "./html"
 

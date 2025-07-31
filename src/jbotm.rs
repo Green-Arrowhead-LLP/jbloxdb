@@ -45,6 +45,7 @@ use memchr::memchr;
 
 use std::thread;
 use std::clone::Clone;
+use serde_json::{ Number};
 
 #[cfg(unix)]
 unsafe fn discard_pages(ptr: *mut u8, len: usize) {
@@ -220,6 +221,89 @@ struct SharedState {
         process::exit(1);
     }
 
+
+
+    /// Extracts and parses the embedded JSON after the second `:` in `rec2`.
+    /// Returns the parsed `Value` on success, or `Value::Null` on any error.
+    pub fn extract_json(rec2: &str,recorddelimt: char) -> Value {
+        // Split on the first two ':' characters
+        let mut parts = rec2.splitn(3, recorddelimt); //":"
+        let _prefix = parts.next();            // "00-2807…000506"
+        let _meta   = parts.next();            // "hostkey-HOST1234"
+        let json_snip = parts.next().unwrap_or("").trim_end_matches(';');
+        
+        // Parse that snippet directly as JSON
+        serde_json::from_str(json_snip).unwrap_or(Value::Null)
+    }
+
+    /// Recursively merge `patch` into `master` in‑place.
+    ///
+    /// - If both are JSON objects, their entries are merged/overwritten.
+    /// - Otherwise, `master` is replaced by `patch`.
+    pub fn merge_in_place_limited(master: &mut Value, patch: &Value) {
+        match (master, patch) {
+            (Value::Object(m), Value::Object(p)) => {
+                for (k, pv) in p {
+                    match m.get_mut(k) {
+                        Some(mv) => merge_in_place(mv, pv),
+                        None     => { m.insert(k.clone(), pv.clone()); }
+                    }
+                }
+            }
+            // For non‑objects (or mismatched types), just overwrite:
+            (m_slot, p_slot) => {
+                *m_slot = p_slot.clone();
+            }
+        }
+    }
+
+    /// Recursively merge `patch` into `master` in‑place.
+    /// Special case: if `patch` is a string of the form "+=<n>", and `master` is a number,
+    /// then add `<n>` to the original number instead of overwriting.
+    fn merge_in_place(master: &mut Value, patch: &Value) {
+        match (master, patch) {
+            (Value::Object(m), Value::Object(p)) => {
+                for (k, pv) in p {
+                    match m.get_mut(k) {
+                        Some(mv) => merge_in_place(mv, pv),
+                        None => {
+                            m.insert(k.clone(), pv.clone());
+                        }
+                    }
+                }
+            }
+            (m_slot, p_slot) => {
+                // Handle "+=<value>" addition syntax
+                if let Value::String(s) = p_slot {
+                    if let Some(rest) = s.strip_prefix("+=") {
+                        // If master is a number, attempt addition
+                        if let Value::Number(orig_num) = m_slot {
+                            // Integer addition
+                            if let (Some(orig_i), Ok(add_i)) = (orig_num.as_i64(), rest.parse::<i64>()) {
+                                *m_slot = Value::Number(Number::from(orig_i + add_i));
+                                return;
+                            }
+                            // Floating‑point addition
+                            if let (Some(orig_f), Ok(add_f)) = (orig_num.as_f64(), rest.parse::<f64>()) {
+                                *m_slot = Value::from(orig_f + add_f);
+                                return;
+                            }
+                        }
+                    }
+                }
+                // Fallback: overwrite with patch
+                *m_slot = p_slot.clone();
+            }
+        }
+    }
+
+
+    /// Convenience wrapper: returns a fresh merged `Value` without mutating inputs.
+    pub fn merge(master: &Value, patch: &Value) -> Value {
+        let mut result = master.clone();
+        merge_in_place(&mut result, patch);
+        result
+    }   
 
 /////////////////////////////////////////////////////
 
@@ -487,163 +571,6 @@ pub fn new_thread() -> io::Result<Self> {
 }
 
 
-    pub fn new_non_thread() -> io::Result<Self> {
-        //get config file path
-        let config_path = get_config_path();
-        println!("Config file path: {}",config_path.to_str().unwrap());
-        let config = Config::builder()
-            .add_source(config::File::with_name(config_path.to_str().unwrap()))
-            .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config build error: {}", e)))?;
-
-        let mut settings: Settings = config
-            .try_deserialize()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Config deserialize error: {}", e)))?;
-
-
-        //directory to be used to store data
-        let datadir = settings.datadir.clone();
-        //log directory
-        let logdir = settings.logdir.clone();
-        println!("log dir: {}",logdir);
-        println!("datadir dir: {}",datadir);
-
-        //log frequency in hours
-        let logmaxlines: usize = settings.logmaxlines;
-        //indexnamevalue delimiter
-        let indexnamevaluedelimiter: char = settings.indexnamevaluedelimiter.clone().to_string().chars().next().unwrap_or('-'); //'-'
-        //index delimiter
-        let indexdelimiter: char = settings.indexdelimiter.clone().to_string().chars().next().unwrap_or('`');//'`'
-        //record delimiter
-        let recorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or(':');//':'
-
-        let repindexnamevaluedelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
-        let repindexdelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
-        let reprecorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
-        
-        //set size_digits 
-        let mut size_digits = 4; // minimum width
-        let max_length_digits = settings.maxrecordlength.to_string().len();
-
-        if max_length_digits >= 4 {
-            size_digits = max_length_digits + 1;
-        }
-
-        let mut log_line_count: usize = 0;
-
-        let log_filename = format!("{}/jblox.log", logdir);
-        println!("log_filename : {}",log_filename);
-        let log_file = BufWriter::new(
-            OpenOptions::new().create(true).append(true).open(&log_filename)?
-        );
-        let log_path = std::path::Path::new(&log_filename);
-        if log_path.exists() {
-            if let Ok(logfileforlines) = File::open(log_path) {
-                let reader = BufReader::new(logfileforlines);
-
-                log_line_count = reader.lines().count();
-            }
-        }
-
-        let mut file_size_map = HashMap::new();
-        let mut file_mmap_map = HashMap::new();
-        let mut file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>> = HashMap::new();
-        let mut file_key_pointer_map = HashMap::new();
-
-
-
-        for entry in std::fs::read_dir(datadir.clone())? {
-        let mut currentoffset:usize = 0;
-        let maxrecord: usize = 20000;
-        let mut currentrecordnum = 0;
-        let mut newrecordnum = 0;
-
-            let path = entry?.path();
-
-            if !(path.extension().and_then(|ext| ext.to_str()) == Some("jblox")) {
-                continue;
-            }
-
-            let mut offsetreturned: usize = 0;
-            let mut keeprunning : bool = true;
-
-            //get file name without extension
-            let file_name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("UNKNOWN");
-            
-            while(keeprunning) { //'0' would mean that all records are processed
-                offsetreturned = load_existing_file(settings.initfilesize,
-                    settings.newfilesizemultiplier,
-                            &path.to_string_lossy().to_string(), 
-                                        &recorddelimiter.to_string(), 
-                                        &indexdelimiter.to_string(), 
-                                        &indexnamevaluedelimiter.to_string(),
-                                        settings.enableviewdelete,
-                                        settings.low_ram_mode,
-                                        settings.MADVISE_CHUNK,
-                                        size_digits,
-                                        settings.maxrecordlength,
-                                        maxrecord,
-                                        currentoffset,
-                                        &mut file_size_map,
-                                        &mut file_mmap_map,
-                                        &mut file_line_map,
-                                        &mut file_key_pointer_map,)?;
-
-                newrecordnum = file_line_map.get(file_name).unwrap().len();
-
-                currentoffset = file_size_map[file_name];
-
-                //if currentoffset == offsetreturned, no more records so break
-                println!("newrecordnum - currentrecordnum : {}, maxrecord: {}",newrecordnum -  currentrecordnum,maxrecord);
-                if((newrecordnum -  currentrecordnum) <  maxrecord){
-                    keeprunning = false;
-                }
-                else{
-                    currentrecordnum = newrecordnum;
-                }
-
-            }
-            let mut file_name_str = "";
-            if let Some(file_name) = path.file_stem() {
-                if let Some(s) = file_name.to_str() {
-                    file_name_str = s;
-                } else {
-                    println!("Non-UTF8 file name, using fallback.");
-                    file_name_str = "UNKNOWN";
-                }
-            } else {
-                println!("Skipping path with no filename: {:?}", path);
-            }
-
-            if let Some(lines) = file_line_map.get(file_name_str) {
-                println!("Total Number of records: {}",lines.len());
-
-            } else {
-                println!("No entry for {}", file_name_str);
-            }
-
-        }
-
-        let state = Arc::new(Mutex::new(SharedState {
-            file_mmap_map,
-        }));
-
-
-        println!("Ready to accept requests.");
-        Ok(Self {settings,
-                file_size_map, 
-                file_line_map, 
-                file_key_pointer_map, 
-                datadir, 
-                logdir, 
-                log_file,
-                log_line_count,
-                state,
-                size_digits,})
-    }
-
     pub fn new() -> io::Result<Self> {
         //get config file path
         let config_path = get_config_path();
@@ -679,12 +606,8 @@ pub fn new_thread() -> io::Result<Self> {
         let reprecorddelimiter: char = settings.recorddelimiter.clone().to_string().chars().next().unwrap_or('_');
         
         //set size_digits 
-        let mut size_digits = 4; // minimum width
-        let max_length_digits = settings.maxrecordlength.to_string().len();
+        let mut size_digits = 7; // Hard coded, to save space. limits size of each record to ~ 10MB
 
-        if max_length_digits >= 4 {
-            size_digits = max_length_digits + 1;
-        }
 
         let mut log_line_count: usize = 0;
 
@@ -1135,7 +1058,7 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
 
                 if check_duplicates {
                     //let key_map = self.extract_keyname_value_map(&json)?;
-                    if let Ok(ptrs) = self.getmain(json_str,true,false,false) {
+                    if let Ok(ptrs) = self.getmainforduplicatecheck(json_str,true,false) {
                         if !ptrs.is_empty() {
                             print!("Duplicate Records");
                             return Err(Error::new(ErrorKind::Other, "Duplicate Record."));
@@ -1424,16 +1347,47 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 println!("Pointer list is empty.");
             } else if update_all {
                 for &ptr in &ptrs {
-                    self.delete_using_pointer_forupdate(file_name, ptr);
+                    let origrec = self.print_line_forpointer(PtrWrapper::new(ptr),false)?;
+
+                    //exract json data
+                    let origjson = extract_json(&origrec,self.settings.recorddelimiter);
+                    let modjson: Value = json.clone();
+                    if(!origjson.is_null()){
+                        //merge json (update json) with orig json data
+                        let mergedjson = merge(&origjson, &modjson);
+
+                        //delete orig record     
+                        self.delete_using_pointer_forupdate(file_name, ptr);
+
+                        //insert merged json 
+                        self.insert_duplicate_frmObject(&mergedjson, timestamp);  
+                    }
+                  
+
                 }
                 println!("Deleted {} records.", ptrs.len());
             } else {
                 if let Some(&farthest_ptr) = ptrs.iter().max_by_key(|&&p| p as usize) {
+
+                    let origrec = self.print_line_forpointer(PtrWrapper::new(farthest_ptr),false)?;
+
+                    //exract json data
+                    let origjson = extract_json(&origrec,self.settings.recorddelimiter);
+                    let modjson: Value = json.clone();
+
+                    //merge json (update json) with orig json data
+                    let mergedjson = merge(&origjson, &modjson);
+
+                    //delete orig record
                     self.delete_using_pointer_forupdate(file_name, farthest_ptr);
+                    
+                    //insert merged json 
+                    self.insert_duplicate_frmObject(&mergedjson, timestamp);
+
                     println!("Deleted last record.");
                 }
             }
-            self.insert_duplicate_frmObject(&json, timestamp);
+
         } else {
             println!("No Record found.");
         }
@@ -1547,7 +1501,41 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
        return self.getmain(&json_str, false,false,true);  
     }
 
-  
+    //apply AND between the keys
+    pub fn getmainforduplicatecheck(&mut self, 
+                    json_str: &str,
+                    use_intersection: bool,
+                    includedelete: bool) -> std::io::Result<Vec<String>> {
+
+        use std::io::{Error, ErrorKind};
+        use serde_json::Value;
+
+        // Parse the JSON string
+        let json: Value = serde_json::from_str(json_str)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid JSON: {}", e)))?;
+
+        // Ensure it's an object
+        let obj = json.as_object().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "Expected JSON object at root")
+        })?;
+
+        let file_name = obj.get("keyobj")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
+        
+        //paging implementation for get
+        let recstart = "0";
+
+        //get key->keyvalue map
+        let key_map = self.extract_keyname_value_map(&json)?;    
+        // Call the existing method
+        let lines = self.get_fromkey_forduplicate(file_name, &key_map, &recstart, use_intersection,includedelete,false);
+        for line in &lines {
+            println!("Line: {}", line);
+        }
+        Ok(lines)
+
+    }  
     //apply AND between the keys
     pub fn getmain(&mut self, 
                     json_str: &str,
@@ -1574,12 +1562,115 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         //paging implementation for get
         let recstart = obj.get("recstart").and_then(Value::as_str).unwrap_or("0");
 
+        //paging implementation for get
+        let mut maxrecordscount: usize = obj
+                                    .get("maxrecordscount")
+                                    .and_then(Value::as_u64)        // → Option<u64>
+                                    .map(|n| n as usize)            // → Option<usize>
+                                    .unwrap_or(self.settings.maxgetrecords);   
+
+        if(maxrecordscount > self.settings.maxgetrecords){
+            maxrecordscount = self.settings.maxgetrecords;
+        }                        
+
+
         //get key->keyvalue map
         let key_map = self.extract_keyname_value_map(&json)?;    
         // Call the existing method
-        let lines = self.get_fromkey(file_name, &key_map, &recstart, use_intersection,includedelete,reverse);
+        let lines = self.get_fromkey(file_name, &key_map, &recstart, use_intersection,includedelete,reverse,maxrecordscount);
         Ok(lines)
 
+    }
+
+    pub fn get_fromkey_forduplicate(
+        &mut self,
+        file_name: &str,
+        key_map: &HashMap<String, String>,
+        recstart: &str, //if "0" send records from begining, else start from this record (including)
+        use_intersection: bool,
+        includedelete: bool,
+        reverse: bool, //currently ingnored
+    ) -> Vec<String> {
+
+        let mut result: Vec<PtrWrapper> = Vec::new(); // ✅ Flat vector
+        let mut found_keystart = recstart == "0";
+
+        if !use_intersection{
+            let mut seen = HashSet::new();
+
+            for (keyname, keyvalue) in key_map {
+                if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
+                    if let Some(val_map) = ptrmap.get(keyname) {
+                        if let Some(ptrs) = val_map.get(keyvalue) {
+                            for ptr in ptrs {
+                                let key = ptr.as_ptr(); // Use raw pointer for uniqueness
+                                if seen.insert(key) {
+                                    result.push(ptr.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+        else{
+            let mut is_first = true;
+
+            for (keyname, keyvalue) in key_map {
+                if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
+                    if let Some(val_map) = ptrmap.get(keyname) {
+                        if let Some(ptrs) = val_map.get(keyvalue) {
+                            if ptrs.is_empty() {
+                                result.clear(); // Found empty ptrs -> clear result
+                                break;
+                            }
+                            if is_first {
+                                result = ptrs.iter().cloned().collect();
+                                is_first = false;
+                            } else {
+                                result.retain(|ptr| {
+                                    ptrs.iter().any(|p| p.as_ptr() == ptr.as_ptr())
+                                });
+                                if result.is_empty() {
+                                    break; // Intersection became empty -> stop
+                                }
+                            }
+                        } else {
+                            result.clear(); // keyvalue missing -> clear result
+                            break;
+                        }
+                    } else {
+                        result.clear(); // keyname missing -> clear result
+                        break;
+                    }
+                } else {
+                    result.clear(); // ptrmap missing -> clear result
+                    break;
+                }
+            }
+        }
+        let mut count = 0;
+        for pw in &result {
+            // Convert Err(_) → empty string
+            let line = match self.print_line_forpointer(pw.clone(), false) {
+                Ok(s) => s,
+                Err(_) => String::new(),
+            };
+            //println!("record found: {}",line);
+            if !line.is_empty() {
+                count += 1;
+                break;
+            }
+        }
+
+        let mut result_lines: Vec<String> = Vec::new();
+
+        if(count > 0){
+            let meta_json_str = format!(r#"{{"meta":{{"total_count":{}}}}}"#, ">0");
+            result_lines.push(meta_json_str.clone());        
+        }
+        return result_lines;
     }
 
     pub fn get_fromkey(
@@ -1590,6 +1681,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         use_intersection: bool,
         includedelete: bool,
         reverse: bool,   //send records in decending
+        maxrecordscount: usize, //max number of records to return
     ) -> Vec<String> {
 
         let mut result: Vec<PtrWrapper> = Vec::new(); // ✅ Flat vector
@@ -1664,11 +1756,15 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         let meta_json_str = format!(r#"{{"meta":{{"total_count":{}}}}}"#, total_records);
         result_lines.push(meta_json_str.clone());
 
+        let mut actualreccound : usize = 0;
+
+        let mut recordsadded: usize = 0;
+
+
         for ptr in result {
-            if result_lines.len() >= self.settings.maxgetrecords {
-                break;
-            }
+
             if let Ok(line) = self.print_line_forpointer(ptr,includedelete) {
+
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -1677,13 +1773,21 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 if !found_keystart {
                     if line.starts_with(&format!("{}", recstart)) {
                         found_keystart = true;
-                        result_lines.push(line.to_string());
+                        if result_lines.len() < maxrecordscount {
+                            result_lines.push(line.to_string());
+                        }
+                        actualreccound += 1;
                     }
                 } else {
-                    result_lines.push(line.to_string());
+                        if result_lines.len() < maxrecordscount {
+                            result_lines.push(line.to_string());
+                        }
+                        actualreccound += 1;
                 }
             }
         }
+        //reset count
+        result_lines[0] = format!(r#"{{"meta":{{"total_count":{}}}}}"#, actualreccound);
 
         if result_lines.is_empty() {
             //eprintln!("No matching records found.");

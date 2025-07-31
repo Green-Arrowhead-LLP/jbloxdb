@@ -9,7 +9,7 @@
 #initial file size (in MBs), file size of data file (used to store data)
 #that you expect not to out grow soon. You will have to restart
 #jbloxDB if file size is reached. jbloxDB might restart on its own
-#if jbloxDB is not started by the admin. 
+#if jbloxDB is not started by the admin.
 initfilesize = 1 
 
 #once file size reaches initfilesize, jbloxDB increases size by this
@@ -27,11 +27,11 @@ logdir = "./log"
 maxgetrecords = 100
 
 #maximum length of record
-maxrecordlength = 327680
+maxrecordlength = 40960
 
 #max number of lines in log file before creating a new one
 #'0' indicates do not recreate ever.
-logmaxlines = 500
+logmaxlines = 5000
  
 #delimiter used to separate name and value of index
 indexnamevaluedelimiter = "-"
@@ -53,7 +53,6 @@ repindexdelimiter = "_"
 #replacemenet for recorddelimiter, if record contain delimter
 #used by jbloxdb, they will be replace by the following
 reprecorddelimiter = "_"
-
 
 #feature enables to view deleted records if they exist in the file
 enableviewdelete = true

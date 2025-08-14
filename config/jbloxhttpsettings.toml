@@ -18,5 +18,5 @@ maxbuffer = 2097152
 htmldir = "./html"
 
 #default page
-defaultpage = "test.html"
+defaultpage = "test_SingleTimeDisplayForBothTA.html"
 

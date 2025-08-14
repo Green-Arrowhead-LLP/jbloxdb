@@ -5,7 +5,9 @@
 // Free for individuals and small companies.
 // Commercial license required for production use by companies over USD 5M revenue or for SaaS/product distribution.
 
+use hyper::body::Body;
 use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap};
 use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
@@ -21,7 +23,9 @@ use config::Config;
 use chrono::Local;
 use anyhow::Result;
 use std::time::{Duration};
- 
+use std::error::Error;
+use std::slice;
+
 use serde_json::{json};
 
 use std::env;
@@ -46,6 +50,13 @@ use memchr::memchr;
 use std::thread;
 use std::clone::Clone;
 use serde_json::{ Number};
+
+use std::collections::{BTreeMap};
+use std::cmp::Ordering;
+use std::borrow::Borrow;
+
+use std::ops::Bound;
+use std::ops::Bound::{Included, Excluded, Unbounded};
 
 #[cfg(unix)]
 unsafe fn discard_pages(ptr: *mut u8, len: usize) {
@@ -107,9 +118,53 @@ impl std::hash::Hash for PtrWrapper {
 unsafe impl Send for PtrWrapper {}
 unsafe impl Sync for PtrWrapper {}
 
+//for sorting keys
+#[derive(Debug, Eq, PartialEq)]
+struct NumKey(String);
+
+impl Ord for NumKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Try numeric comparison
+        match (self.0.parse::<usize>(), other.0.parse::<usize>()) {
+            (Ok(a), Ok(b)) => a.cmp(&b),
+            _ => self.0.cmp(&other.0), // fallback to normal string comparison
+        }
+    }
+}
+
+impl PartialOrd for NumKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::hash::Hash for NumKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl From<&str> for NumKey {
+    fn from(s: &str) -> Self { NumKey(s.to_string()) }
+}
+
+impl From<String> for NumKey {
+    fn from(s: String) -> Self { NumKey(s) }
+}
+
+// optional convenience
+impl From<usize> for NumKey {
+    fn from(n: usize) -> Self { NumKey(n.to_string()) }
+}
+
+// Let lookups by &str work: map.get("10")
+impl Borrow<str> for NumKey {
+    fn borrow(&self) -> &str { &self.0 }
+}
+
 #[derive(Debug, Deserialize,Clone)]
 pub struct Settings {
-    initfilesize:f64, //in MB
+    initfilesize:String, 
     newfilesizemultiplier:f32, //new file size = this var times existing size
     datadir: String,
     logdir: String,
@@ -126,19 +181,21 @@ pub struct Settings {
     enableviewdelete: bool,
     MADVISE_CHUNK: usize,
     low_ram_mode: bool,
+    notoperator: String,
 
 } 
 pub struct jbothandler {
     settings: Settings,
     file_size_map: HashMap<String, usize>, //file->file length
     //file_mmap_map: HashMap<String, MmapMut>,//file->mmep of file
-    file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>>,//file->pointer vector
-    file_key_pointer_map: HashMap<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>, //file->key name -> key -> pointer
+    file_line_map: HashMap<String, HashMap<usize, usize>>,//file->pointer vector
+    file_key_pointer_map: HashMap<String, HashMap<String, BTreeMap<NumKey, Vec<usize>>>>, //file->key name -> key -> pointer
     datadir: String,
     logdir: String,
     log_file: BufWriter<File>,
     log_line_count : usize,
     state: Arc<Mutex<SharedState>>,
+    stateR: Arc<Mutex<SharedStateR>>,
     size_digits: usize,
 
 
@@ -147,7 +204,9 @@ pub struct jbothandler {
 struct SharedState {
     file_mmap_map: HashMap<String, MmapMut>,
 }
-
+struct SharedStateR {
+    file_mmap_map_forread: HashMap<String, Mmap>,
+}
     /// Quickly checks if any valid record exists in later half of file.
     /// Returns true if found, false otherwise.
     pub fn records_exist_in_second_half(
@@ -185,6 +244,7 @@ struct SharedState {
         Ok(false) // No valid records found in later half
     }
 
+    
     pub fn get_config_path() -> PathBuf {
         let mut current_dir = match env::current_exe()
             .ok()
@@ -305,11 +365,44 @@ struct SharedState {
         result
     }   
 
+
+
+/// spec_or_line: either just the RHS like "1;customer:3;user:40"
+///               or the full "initfilesize = 1;customer:3;user:40"
+/// file: the file/key to look up, e.g. "user", "customer"
+/// this will enable admins to configure customezed file size for different stores
+pub fn value_with_overrides(spec_or_line: &str, file: &str) -> usize {
+    // Accept either "name = spec" or just "spec"
+    let rhs = spec_or_line.split_once('=').map(|(_, rhs)| rhs).unwrap_or(spec_or_line);
+
+    // tokens are like: ["1", "customer:3", "user:40"]
+    let mut toks = rhs.split(';').map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    // default value (if missing or non-numeric → 0)
+    let default_val = toks
+        .next()
+        .and_then(|t| t.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // scan overrides: "key:value"
+    for tok in toks {
+        if let Some((k, vstr)) = tok.split_once(':') {
+            if k.trim() == file {
+                if let Ok(v) = vstr.trim().parse::<usize>() {
+                    return v;
+                }
+            }
+        }
+    }
+
+    // no matching override → default
+    default_val
+}  
 /////////////////////////////////////////////////////
 
 pub fn load_existing_file(
-    initfilesize: f64,
-    filesizemultiplier: f32,
+    initfilesize: String,
+    filesizemultiplier: f32, //for future use
     filepath: &str,
     recorddelimiter: &str,
     indexdelimiter: &str,
@@ -323,8 +416,9 @@ pub fn load_existing_file(
     inputoffset: usize,
     file_size_map: &mut HashMap<String, usize>,
     file_mmap_map: &mut HashMap<String, memmap2::MmapMut>,
-    file_line_map: &mut HashMap<String, Vec<(PtrWrapper, usize)>>,
-    file_key_pointer_map: &mut HashMap<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>,
+    file_mmap_map_forread: &mut HashMap<String, memmap2::Mmap>,
+    file_line_map: &mut HashMap<String, HashMap<usize, usize>>,
+    file_key_pointer_map: &mut HashMap<String, HashMap<String, BTreeMap<NumKey, Vec<usize>>>>,
 ) -> std::io::Result<usize> {
     const TIMESTAMP_LEN: usize = 18;
     let path = Path::new(filepath);
@@ -334,13 +428,25 @@ pub fn load_existing_file(
         let fname = path.file_stem().unwrap().to_string_lossy().to_string();
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let filemetadata = file.metadata()?;
-        let current_file_size = filemetadata.len() as usize;
 
+        let mut current_file_size = filemetadata.len() as usize;
+
+        let mut configuredfilesize 
+                    = value_with_overrides(&initfilesize, &fname);
+        let initfilesizebytes =  configuredfilesize*1064*1064;
+        //set to configured file size
+        if(current_file_size < initfilesizebytes){
+             file.set_len(initfilesizebytes as u64)?;
+             current_file_size = initfilesizebytes;
+        }
+        let fileread =     file.try_clone()?;
+
+
+        let mmapread = unsafe { MmapOptions::new().map(&fileread)? };
         let mut mmap: MmapMut = unsafe { MmapOptions::new().len(current_file_size).map_mut(&file)? };
         let base: PtrWrapper = PtrWrapper(UnsafeCell::new(mmap.as_mut_ptr()));
-        let baseptr = base.as_ptr();
-
-        let lines = file_line_map.entry(fname.clone()).or_insert_with(Vec::new);
+        let baseptr = base.as_ptr().addr();
+        let lines = file_line_map.entry(fname.clone()).or_insert_with(HashMap::new);
         let keymap = file_key_pointer_map.entry(fname.clone()).or_insert_with(HashMap::new);
 
         let delim_u16 = if recorddelimiter.as_bytes().len() >= 2 {
@@ -348,7 +454,6 @@ pub fn load_existing_file(
         } else {
             u16::from_le_bytes([recorddelimiter.as_bytes()[0], 0])
         };
-
         while offset < current_file_size {
             let size_start = offset + ((3 + TIMESTAMP_LEN + 1) * 2);
             let size_end = size_start + (size_digits * 2);
@@ -370,8 +475,10 @@ pub fn load_existing_file(
                 break;
             }
 
-            let recptr = PtrWrapper::from_base_and_offset(baseptr, offset);
-            lines.push((recptr.clone(), record_len));
+            //let recptr = PtrWrapper::from_base_and_offset(baseptr, offset);
+            let recptr = offset;
+
+            lines.insert(recptr, record_len);
 
             let mut i = size_end + 2;
             let record_end = offset + record_len;
@@ -391,8 +498,8 @@ pub fn load_existing_file(
                         let key_name = &part[..dash_pos];
                         let key_value = &part[dash_pos + 1..];
                         keymap.entry(key_name.to_string()).or_default()
-                            .entry(key_value.to_string()).or_default()
-                            .push(recptr.clone());
+                            .entry(NumKey(key_value.into())).or_default()
+                            .push(recptr);
                     }
                 }
             }
@@ -400,6 +507,7 @@ pub fn load_existing_file(
             offset += record_len;
         }
 
+        file_mmap_map_forread.insert(fname.clone(), mmapread);
         file_mmap_map.insert(fname.clone(), mmap);
         file_size_map.insert(fname.clone(), offset);
     }
@@ -446,6 +554,7 @@ pub fn new_thread() -> io::Result<Self> {
 
     let log_filename = format!("{}/jblox.log", logdir);
     println!("log_filename : {}", log_filename);
+
     let log_file = BufWriter::new(OpenOptions::new().create(true).append(true).open(&log_filename)?);
 
     let log_path = std::path::Path::new(&log_filename);
@@ -459,8 +568,9 @@ pub fn new_thread() -> io::Result<Self> {
 
     let file_size_map = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
     let file_mmap_map = Arc::new(Mutex::new(HashMap::<String, MmapMut>::new()));
-    let file_line_map = Arc::new(Mutex::new(HashMap::<String, Vec<(PtrWrapper, usize)>>::new()));
-    let file_key_pointer_map = Arc::new(Mutex::new(HashMap::<String, HashMap<String, HashMap<String, Vec<PtrWrapper>>>>::new()));
+    let file_mmap_map_forread = Arc::new(Mutex::new(HashMap::<String, Mmap>::new()));
+    let file_line_map = Arc::new(Mutex::new(HashMap::<String, HashMap<usize, usize>>::new()));
+    let file_key_pointer_map = Arc::new(Mutex::new(HashMap::<String, HashMap<String, BTreeMap<NumKey, Vec<usize>>>>::new()));
 
     let size_digits = {
         let max_length_digits = settings.maxrecordlength.to_string().len();
@@ -493,6 +603,7 @@ pub fn new_thread() -> io::Result<Self> {
             let file_name_for_thread = file_name.clone(); // clone for this thread
 
             let file_size_map_thread = Arc::clone(&file_size_map);
+            let file_mmap_map_forread_thread = Arc::clone(&file_mmap_map_forread);
             let file_mmap_map_thread = Arc::clone(&file_mmap_map);
             let file_line_map_thread = Arc::clone(&file_line_map);
             let file_key_pointer_map_thread = Arc::clone(&file_key_pointer_map);
@@ -514,6 +625,7 @@ pub fn new_thread() -> io::Result<Self> {
                     currentoffset,
                     &mut file_size_map_thread.lock().unwrap(),
                     &mut file_mmap_map_thread.lock().unwrap(),
+                    &mut file_mmap_map_forread_thread.lock().unwrap(),
                     &mut file_line_map_thread.lock().unwrap(),
                     &mut file_key_pointer_map_thread.lock().unwrap(),
                 ).unwrap();
@@ -555,6 +667,9 @@ pub fn new_thread() -> io::Result<Self> {
         file_mmap_map: Arc::try_unwrap(file_mmap_map).unwrap().into_inner().unwrap(),
     }));
 
+    let stateR = Arc::new(Mutex::new(SharedStateR {
+        file_mmap_map_forread: Arc::try_unwrap(file_mmap_map_forread).unwrap().into_inner().unwrap(),
+    }));    
     println!("Ready to accept requests.");
     Ok(Self {
         settings,
@@ -566,6 +681,7 @@ pub fn new_thread() -> io::Result<Self> {
         log_file,
         log_line_count,
         state,
+        stateR,
         size_digits,
     })
 }
@@ -590,7 +706,7 @@ pub fn new_thread() -> io::Result<Self> {
         let logdir = settings.logdir.clone();
         println!("log dir: {}",logdir);
         println!("datadir dir: {}",datadir);
-    
+
         //
         //log frequency in hours
         let logmaxlines: usize = settings.logmaxlines;
@@ -627,7 +743,8 @@ pub fn new_thread() -> io::Result<Self> {
 
         let mut file_size_map = HashMap::new();
         let mut file_mmap_map = HashMap::new();
-        let mut file_line_map: HashMap<String, Vec<(PtrWrapper, usize)>> = HashMap::new();
+        let mut file_mmap_map_forread = HashMap::new();
+        let mut file_line_map: HashMap<String, HashMap<usize, usize>> = HashMap::new();
         let mut file_key_pointer_map = HashMap::new();
 
 
@@ -653,7 +770,7 @@ pub fn new_thread() -> io::Result<Self> {
                 .unwrap_or("UNKNOWN");
             
             while(keeprunning) { //'0' would mean that all records are processed
-                offsetreturned = load_existing_file(settings.initfilesize,
+                offsetreturned = load_existing_file(settings.initfilesize.clone(),
                     settings.newfilesizemultiplier,
                             &path.to_string_lossy().to_string(), 
                                         &recorddelimiter.to_string(), 
@@ -668,6 +785,7 @@ pub fn new_thread() -> io::Result<Self> {
                                         currentoffset,
                                         &mut file_size_map,
                                         &mut file_mmap_map,
+                                        &mut file_mmap_map_forread,
                                         &mut file_line_map,
                                         &mut file_key_pointer_map,)?;
 
@@ -709,6 +827,9 @@ pub fn new_thread() -> io::Result<Self> {
         let state = Arc::new(Mutex::new(SharedState {
             file_mmap_map,
         }));
+        let stateR = Arc::new(Mutex::new(SharedStateR {
+            file_mmap_map_forread,
+        }));
 
 
     println!("Ready to accept requests.");
@@ -721,7 +842,51 @@ pub fn new_thread() -> io::Result<Self> {
                 log_file,
                 log_line_count,
                 state,
+                stateR,
                 size_digits,})
+    }
+
+    //Rank (0-based index by key order)
+    //Returns how many keys are strictly less than the target (i.e., its position), 
+    //or None if the key doesn’t exist.
+    pub fn rank_of_key<V>(&mut self, map: &BTreeMap<NumKey, V>, key: &str) -> Option<usize> {
+        if !map.contains_key(key) { return None; }
+        // Count keys less than `key`. This is O(k) where k is #keys < target.
+        let k = NumKey::from(key);
+        Some(map.range(..k).count())
+    }
+
+    //Get by key (nice ergonomics)
+    pub fn get_values<'a, V>(&mut self, map: &'a BTreeMap<NumKey, V>, key: &str) -> Option<&'a V> {
+        map.get(key) // thanks to Borrow<str> impl
+    }
+
+    //Get key/value by index (the inverse)    
+    pub fn nth_entry<'a, V>(&mut self, map: &'a BTreeMap<NumKey, V>, idx: usize)
+        -> Option<(&'a NumKey, &'a V)>
+    {
+        map.iter().nth(idx)
+    }        
+
+    pub fn intersection_unique_unordered(&self, a: &[usize], b: &[usize]) -> Vec<usize> {
+        if a.is_empty() || b.is_empty() {
+            return Vec::new();
+        }
+
+        // Build HashSet from the smaller slice; scan the larger one.
+        let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+
+        let mut mem = HashSet::with_capacity(small.len());
+        mem.extend(small.iter().copied());
+
+        // Deduplicate results on the fly.
+        let mut res = HashSet::with_capacity(small.len());
+        for &x in large {
+            if mem.contains(&x) {
+                res.insert(x);
+            }
+        }
+        res.into_iter().collect() // unordered; sort if you need determinism
     }
 
 pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timestamp: &str) -> std::io::Result<()> {
@@ -770,7 +935,10 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
 
     {
         let mut state = self.state.lock().unwrap();
-        let file_mmap_map_t = &mut state.file_mmap_map;
+        let file_mmap_map_t: &mut HashMap<String, MmapMut> = &mut state.file_mmap_map;
+
+        let mut stateR = self.stateR.lock().unwrap();
+        let file_mmap_map_forread_t: &mut HashMap<String, Mmap> = &mut stateR.file_mmap_map_forread;
 
         if !file_mmap_map_t.contains_key(file_name) {
             let mut file = OpenOptions::new()
@@ -778,12 +946,13 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
                 .write(true)
                 .create(true)
                 .open(&file_path)?;
+            let filesizenew = value_with_overrides(&self.settings.initfilesize, file_name);
             println!("initfilesize: {}", self.settings.initfilesize);
-            let newfilesize = self.settings.initfilesize * 1_000_000.0;
+            let newfilesize = filesizenew * 1_000_000;
             file.set_len(newfilesize as u64)?;
 
             load_existing_file(
-                self.settings.initfilesize,
+                self.settings.initfilesize.clone(),
                 self.settings.newfilesizemultiplier,
                 &file_path.to_string_lossy(),
                 &record_delim,
@@ -798,6 +967,7 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
                 0,
                 &mut self.file_size_map,
                 file_mmap_map_t,
+                file_mmap_map_forread_t,
                 &mut self.file_line_map,
                 &mut self.file_key_pointer_map,
             );
@@ -820,9 +990,8 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
 
     *self.file_size_map.get_mut(file_name).unwrap() += line_len;
 
-    let new_ptr = PtrWrapper::new(unsafe { mmap.as_mut_ptr().add(start) });
     let new_record_len = line_len;
-    self.file_line_map.get_mut(file_name).unwrap().push((new_ptr.clone(), new_record_len));
+    self.file_line_map.get_mut(file_name).unwrap().insert(start, new_record_len);
 
     if let Some(key_map) = self.file_key_pointer_map.get_mut(file_name) {
         let mut parts = updated_line.splitn(3, record_delim.as_str());
@@ -833,8 +1002,8 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
                     let key_name = &part[..dash_pos];
                     let key_value = &part[dash_pos + 1..];
                     key_map.entry(key_name.to_string()).or_default()
-                        .entry(key_value.to_string()).or_default()
-                        .push(new_ptr.clone());
+                        .entry(NumKey(key_value.into())).or_default()
+                        .push(start);
                 }
             }
         }
@@ -846,20 +1015,64 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
         eprintln!("⚠️  ERROR: data file size {}%, stopping jbloxdb.", decimal_part * 100.0);
         process::exit(0);
     } else if decimal_part > 0.85 {
-        eprintln!("⚠️  Warning data file size {}%, restart jbloxdb to increase allowed size.", decimal_part * 100.0);
+        eprintln!("⚠️  Warning data file size {}%, increase init file size in config file and restart jbloxdb to increase allowed size.", decimal_part * 100.0);
         eprintln!("⚠️  Warning data file size {}%, Process will stop automatically when file size reaches 98%.", decimal_part * 100.0);
     }
 
     Ok(())
 }
 
-
-pub fn print_line_forpointer(&self, start_ptr: PtrWrapper, includedelete: bool) -> std::io::Result<String> {
+pub fn print_line_forpointer_uselen(&self,file_name: &str, start_ptr_addr: usize, includedelete: bool) -> std::io::Result<String> {
+    let mut retstr = "".to_string();
     let max_len: usize = self.settings.maxrecordlength;
-    let mut u16_buffer = Vec::new();
+    let lines = self.file_line_map.get(file_name.clone()).unwrap();
+    
+
+    let startptr = start_ptr_addr as *mut u8;
+
+    let reclength = lines
+                    .get(&start_ptr_addr)              // Option<&(usize,usize)>
+                    .expect("missing entry");
+    let mut u16_buffer: Vec<u16> = Vec::new();
+    {
+        let mut stateR = self.stateR.lock().unwrap();
+        let file_mmap_map_forread_t = &mut stateR.file_mmap_map_forread;
+        let mmap = file_mmap_map_forread_t.get(file_name).unwrap();
+
+        let maptr = mmap.as_ptr().addr();
+        let start = start_ptr_addr;
+        let end = start + reclength;
+        let bytes = &mmap[start..end];
+
+        // 2) Must be even # of bytes
+        assert!(bytes.len() % 2 == 0, "byte range must be 2-byte aligned");
+
+        // 3) Turn every pair into a u16 code unit
+        let code_units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+
+        // 4) Decode (lossy to avoid panics on malformed)
+        let line2 = String::from_utf16_lossy(&code_units);
+        if includedelete && self.settings.enableviewdelete {
+            retstr = line2.clone();
+        } else if line2.starts_with("00") {
+            retstr = line2.clone();
+        } else {
+            return Ok("".to_string());
+        }
+    }
+    Ok(retstr.to_string())
+}
+
+pub fn print_line_forpointer2(&self, start_addr: usize, includedelete: bool) -> std::io::Result<String> {
+    let max_len: usize = self.settings.maxrecordlength;
+    let mut u16_buffer: Vec<u16> = Vec::new();
 
     for i in 0..max_len {
         unsafe {
+            let start_ptr = start_addr as *mut u8;
             let byte1 = *start_ptr.add(i * 2);
             let byte2 = *start_ptr.add(i * 2 + 1);
             let u16_char = u16::from_le_bytes([byte1, byte2]);
@@ -1048,6 +1261,13 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
 
+        let primkey_field_check = json.get("primkey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing or invalid 'primkey' field",
+            ))?;
+
         if let Some(obj) = json.as_object() {
             if let Some(Value::String(key_name)) = obj.get("key") {
 
@@ -1055,7 +1275,6 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
                 //get key->keyvalue map
                 let key_map = self.extract_keyname_value_map(&json)?;    
                 // Call the existing method
-
                 if check_duplicates {
                     //let key_map = self.extract_keyname_value_map(&json)?;
                     if let Ok(ptrs) = self.getmainforduplicatecheck(json_str,true,false) {
@@ -1238,9 +1457,23 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
 
-        // Step 4: Extract key-value map from JSON
-        let key_map = self.extract_keyname_value_map(&json)?;
 
+        //Step 4 A: Extract primary_key-value map from json
+        let primkey_map: HashMap<String, String> = self.extract_prim_keyname_value_map(&json)?;
+        
+        if(primkey_map.len() == 0){
+            Error::new(ErrorKind::InvalidInput, 
+                "Missing Primary Key : 'primkey', mandatory for delete");
+        }
+
+        
+        // Step 4 B: Extract key-value map from JSON
+        let mut key_map: HashMap<String, String> = primkey_map.clone();
+
+        //if primary key not present do all changes on the bases of key
+        if(primkey_map.len() == 0){
+            key_map = self.extract_keyname_value_map(&json)?;
+        }
         // Step 5: Get matching pointers
         if let Some(ptrs) = self.get_fromkey_onlypointers(file_name, &key_map) {
             if ptrs.is_empty() {
@@ -1249,7 +1482,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 for &ptr in &ptrs {
                     self.delete_using_pointer_fordelete(file_name, ptr);
                 }
-                println!("Deleted {} records.", ptrs.len());
+                println!("Total deleted records count: {} .", ptrs.len());
             } else {
                 if let Some(&farthest_ptr) = ptrs.iter().max_by_key(|&&p| p as usize) {
                     self.delete_using_pointer_fordelete(file_name, farthest_ptr);
@@ -1266,43 +1499,42 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         Ok(lines)
     }
 
-    pub fn delete_using_pointer_fordelete(&mut self, file_name: &str, ptr: *mut u8) {
-        // Get mutable mmap for the file
-        let mut state = self.state.lock().unwrap();
-        let file_mmap_map_t = &mut state.file_mmap_map;
-        if let Some(mmap) = file_mmap_map_t.get_mut(file_name) {
-            let mmap_start = mmap.as_mut_ptr();
-            let mmap_len = mmap.len();
+    pub fn delete_using_pointer_fordelete(&mut self, file_name: &str, addr: usize) {
 
-            unsafe {
-                // Overwrite first byte at the pointer
-                *ptr = b'2'; // Null byte if preferred
-                *ptr.add(1) = 0x00;  // for ucs-2 compatibility
+        {
+            let mut state = self.state.lock().unwrap();
+            let file_mmap_map_t = &mut state.file_mmap_map;
+            let mmap = file_mmap_map_t.get_mut(file_name).unwrap();
 
-            }
-        } else {
-            eprintln!("No mmap found for file '{}'", file_name);
+            mmap[addr]     = b'2'; 
+            mmap[addr + 1] = 0x00;
+            mmap.flush();
+
         }
+
     }
 
-    pub fn delete_using_pointer_forupdate(&mut self, file_name: &str, ptr: *mut u8) {
-        let mut state = self.state.lock().unwrap();
-        let file_mmap_map_t = &mut state.file_mmap_map;
-        // Get mutable mmap for the file
-        if let Some(mmap) = file_mmap_map_t.get_mut(file_name) {
-            let mmap_start = mmap.as_mut_ptr();
-            let mmap_len = mmap.len();
+    pub fn delete_using_pointer_forupdate(&mut self, file_name: &str, addr:usize) {
+        {
+            let mut state = self.state.lock().unwrap();
+            let file_mmap_map_t = &mut state.file_mmap_map;
+            let mmap = file_mmap_map_t.get_mut(file_name).unwrap();
 
-            unsafe {
-                // Overwrite first byte at the pointer
-                *ptr = b'1'; // Null byte if preferred
-                *ptr.add(1) = 0x00;  // for ucs-2 compatibility
-            }
-        } else {
-            eprintln!("No mmap found for file '{}'", file_name);
+            mmap[addr]     = b'1'; 
+            mmap[addr + 1] = 0x00;
+            mmap.flush();
+
         }
     }
-    
+    //restores previous record. How far back depends on the undocount
+    pub fn undo(&mut self, json_str: &str) ->std::io::Result<Vec<String>>{
+        let currtstmp:String = self.current_timestamp();
+        let compact_jsonstr = self.compact_json_str(&json_str)?;
+        self.log_message(&format!("{}-update-{}",currtstmp, compact_jsonstr))?;
+
+        return self.undomain(json_str, &currtstmp); // delete last
+    }
+
     pub fn update(&mut self, json_str: &str) ->std::io::Result<Vec<String>>{
         let currtstmp:String = self.current_timestamp();
         let compact_jsonstr = self.compact_json_str(&json_str)?;
@@ -1318,6 +1550,139 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
 
        return self.updatemain(json_str, true,&currtstmp); // delete all
     }
+
+    pub fn undomain(&mut self, json_str: &str,timestamp: &str) ->std::io::Result<Vec<String>> {
+        use std::io::{Error, ErrorKind};
+
+        // Step 1: Parse the input JSON string into a Value.
+        let json: Value = serde_json::from_str(json_str)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Step 3: Validate JSON is an object
+        if !json.is_object() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSON input is not an object",
+            ));
+        }
+
+        let file_name = json.get("keyobj")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
+
+        //Step 4 A: Extract primary_key-value map from json
+        let primkey_map: HashMap<String, String> = self.extract_prim_keyname_value_map(&json)?;
+
+        //get undo count
+        let undocount: i64 = if let Some(n) = json.get("undocount").and_then(|v| v.as_i64()) {
+            if n < 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("'undocount' must be >= 1, got {}", n),
+                ));
+            }
+            n
+        } else {
+            1 // default
+        };
+
+        if(primkey_map.len() == 0){
+            Error::new(ErrorKind::InvalidInput, 
+                "Missing Primary Key : 'primkey', mandatory for undo");
+        }
+
+
+        // Step 4 B: Extract key-value map from JSON
+        let mut key_map: HashMap<String, String> = primkey_map.clone();
+
+
+
+        // Step 5: Get matching pointers
+        
+        if let Some(ptrs) = self.get_fromkey_onlypointers(file_name, &key_map) {
+
+            // collect into a mutable Vec (works whether ptrs is Vec or slice)
+            let mut sortedptrs: Vec<usize> = ptrs.iter().copied().collect();
+
+            // sort descending by address
+            sortedptrs.sort_by(|a, b| ((*b as usize).cmp(&(*a as usize))));
+
+            let farthest_ptr: usize = sortedptrs[sortedptrs.len()-1];
+
+
+            if ptrs.is_empty() {
+                println!("No record found - 2");
+            }else {
+                let mut currentundocount = 0 as i64;
+                let mut undororigecord: String = String::new();
+                let mut undorecpointer:  *mut u8 = std::ptr::null_mut();
+                // inspect each line for every pointer
+                for &ptr in sortedptrs.iter() {
+                    match self.print_line_forpointer_uselen(file_name, ptr, true) {
+                        Ok(line) => {
+                            //last pointer will point to current record
+                            if(currentundocount == 0){
+                                if(line.starts_with('0')){
+                                    currentundocount += 1;
+                                    continue;
+                                }
+                                else{
+                                    currentundocount = 1;
+                                }
+                            }
+                            //get deleted/updated record only
+                            if !line.starts_with('0') {
+                               if(currentundocount == undocount){
+                                //current count is equal to the count requested
+                                //so, get the record
+                                undororigecord = line.clone();
+                                undorecpointer = ptr.clone() as *mut u8;
+                                break;
+                               }
+                               else{
+                                //increment current count, till undocount
+                                    currentundocount += 1;
+                               }
+                            }
+                            // replace this with whatever inspection logic you need
+                            //println!("Pointer {:?} -> line: {}", ptr, line);
+                        }
+                        Err(e) => {
+                            Error::new(ErrorKind::InvalidInput, 
+                                "No record found");
+                        }
+                    }
+                }
+                if(currentundocount < undocount 
+                    || 
+                    undororigecord.is_empty() 
+                    || 
+                    undororigecord.len() == 0){
+                            let errorstr = format!("No record found, old records count: {} ", currentundocount);
+                            Error::new(ErrorKind::InvalidInput, 
+                                errorstr);
+                }
+
+                //exract json data
+                let origjson = extract_json(&undororigecord,self.settings.recorddelimiter);
+
+                //delete orig record
+                self.delete_using_pointer_forupdate(file_name, farthest_ptr);
+                
+                self.insert_duplicate_frmObject(&origjson, timestamp);
+
+                println!("Undo complete.");
+            }
+
+        } else {
+            println!("No Record found - 3");
+        }
+
+        let lines = vec![
+            String::from("done")
+        ];
+        Ok(lines)
+    }    
+
 
     pub fn updatemain(&mut self, json_str: &str, update_all: bool, timestamp: &str) ->std::io::Result<Vec<String>> {
         use std::io::{Error, ErrorKind};
@@ -1338,8 +1703,16 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
 
-        // Step 4: Extract key-value map from JSON
-        let key_map = self.extract_keyname_value_map(&json)?;
+        //Step 4 A: Extract primary_key-value map from json
+        let primkey_map: HashMap<String, String> = self.extract_prim_keyname_value_map(&json)?;
+            
+        // Step 4 B: Extract key-value map from JSON
+        let mut key_map: HashMap<String, String> = primkey_map.clone();
+
+        //if primary key not present do all changes on the bases of key
+        if(primkey_map.len() == 0){
+            key_map = self.extract_keyname_value_map(&json)?;
+        }
 
         // Step 5: Get matching pointers
         if let Some(ptrs) = self.get_fromkey_onlypointers(file_name, &key_map) {
@@ -1347,7 +1720,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 println!("Pointer list is empty.");
             } else if update_all {
                 for &ptr in &ptrs {
-                    let origrec = self.print_line_forpointer(PtrWrapper::new(ptr),false)?;
+                    let origrec = self.print_line_forpointer_uselen(file_name,ptr,false)?;
 
                     //exract json data
                     let origjson = extract_json(&origrec,self.settings.recorddelimiter);
@@ -1369,7 +1742,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             } else {
                 if let Some(&farthest_ptr) = ptrs.iter().max_by_key(|&&p| p as usize) {
 
-                    let origrec = self.print_line_forpointer(PtrWrapper::new(farthest_ptr),false)?;
+                    let origrec = self.print_line_forpointer_uselen(file_name,farthest_ptr,false)?;
 
                     //exract json data
                     let origjson = extract_json(&origrec,self.settings.recorddelimiter);
@@ -1522,16 +1895,25 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         let file_name = obj.get("keyobj")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing or invalid 'keyobj'"))?;
-        
+
+
         //paging implementation for get
         let recstart = "0";
+        //Extract primary_key-value map from json
+        let primkey_map: HashMap<String, String> = self.extract_prim_keyname_value_map(&json)?;
+        if(primkey_map.len() == 0){
+            Error::new(ErrorKind::InvalidInput, 
+                "Missing Primary Key : 'primkey', mandatory for insert");
+        }
 
+        
         //get key->keyvalue map
-        let key_map = self.extract_keyname_value_map(&json)?;    
         // Call the existing method
-        let lines = self.get_fromkey_forduplicate(file_name, &key_map, &recstart, use_intersection,includedelete,false);
+        let lines = self.get_fromkey_forduplicate(file_name, &primkey_map, &recstart, use_intersection,includedelete,false);
         for line in &lines {
             println!("Line: {}", line);
+            //need to print just one record, no need to print all
+            break;
         }
         Ok(lines)
 
@@ -1592,7 +1974,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         reverse: bool, //currently ingnored
     ) -> Vec<String> {
 
-        let mut result: Vec<PtrWrapper> = Vec::new(); // ✅ Flat vector
+        let mut result: Vec<usize> = Vec::new(); // ✅ Flat vector
         let mut found_keystart = recstart == "0";
 
         if !use_intersection{
@@ -1601,9 +1983,9 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             for (keyname, keyvalue) in key_map {
                 if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
                     if let Some(val_map) = ptrmap.get(keyname) {
-                        if let Some(ptrs) = val_map.get(keyvalue) {
+                        if let Some(ptrs) = val_map.get(&NumKey(keyvalue.into()) ) {
                             for ptr in ptrs {
-                                let key = ptr.as_ptr(); // Use raw pointer for uniqueness
+                                let key = ptr; // Use raw pointer for uniqueness
                                 if seen.insert(key) {
                                     result.push(ptr.clone());
                                 }
@@ -1620,7 +2002,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             for (keyname, keyvalue) in key_map {
                 if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
                     if let Some(val_map) = ptrmap.get(keyname) {
-                        if let Some(ptrs) = val_map.get(keyvalue) {
+                        if let Some(ptrs) = val_map.get(&NumKey(keyvalue.into())) {
                             if ptrs.is_empty() {
                                 result.clear(); // Found empty ptrs -> clear result
                                 break;
@@ -1630,7 +2012,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                                 is_first = false;
                             } else {
                                 result.retain(|ptr| {
-                                    ptrs.iter().any(|p| p.as_ptr() == ptr.as_ptr())
+                                    ptrs.iter().any(|p| p == ptr)
                                 });
                                 if result.is_empty() {
                                     break; // Intersection became empty -> stop
@@ -1653,7 +2035,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         let mut count = 0;
         for pw in &result {
             // Convert Err(_) → empty string
-            let line = match self.print_line_forpointer(pw.clone(), false) {
+            let line = match self.print_line_forpointer_uselen(file_name,pw.clone(), false) {
                 Ok(s) => s,
                 Err(_) => String::new(),
             };
@@ -1673,6 +2055,45 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         return result_lines;
     }
 
+
+    /// Returns all record ids from `val_map` that satisfy the condition in `cond`,
+    /// where `cond` is like ">=200", "<=400", ">", "<".
+    /// `val_map` is assumed to be `BTreeMap<String, Vec<usize>>` (string-ordered keys).
+    fn filterOnRange(&self,cond: &str, val_map: &BTreeMap<NumKey, Vec<usize>>) -> Vec<usize> {
+        // Trim whitespace first
+        let cond = cond.trim();
+
+        // Detect operator, prioritizing two-char ops
+        let (op, key_str) = if let Some(rest) = cond.strip_prefix(">=") {
+            (">=", rest.trim())
+        } else if let Some(rest) = cond.strip_prefix("<=") {
+            ("<=", rest.trim())
+        } else if let Some(rest) = cond.strip_prefix('>') {
+            (">", rest.trim())
+        } else if let Some(rest) = cond.strip_prefix('<') {
+            ("<", rest.trim())
+        } else {
+            panic!("bad op in condition: '{cond}' (expected one of: >=, <=, >, <)");
+        };
+
+        if key_str.is_empty() {
+            panic!("empty key after operator in condition: '{cond}'");
+        }
+
+        // Build the range iterator based on the operator
+        let iter = match op {
+            "<"  => val_map.range::<str, _>((Unbounded, Excluded(key_str))),
+            "<=" => val_map.range::<str, _>((Unbounded, Included(key_str))),
+            ">"  => val_map.range::<str, _>((Excluded(key_str), Unbounded)),
+            ">=" => val_map.range::<str, _>((Included(key_str), Unbounded)),
+            _    => unreachable!("op already validated"),
+        };
+
+        // Flatten all Vec<usize> values into a single Vec<usize>
+        iter.flat_map(|(_, v)| v.iter().copied()).collect()
+    }
+
+
     pub fn get_fromkey(
         &mut self,
         file_name: &str,
@@ -1684,25 +2105,131 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         maxrecordscount: usize, //max number of records to return
     ) -> Vec<String> {
 
-        let mut result: Vec<PtrWrapper> = Vec::new(); // ✅ Flat vector
+        let mut result: Vec<usize> = Vec::new(); // ✅ Flat vector
         let mut found_keystart = recstart == "0";
 
         if !use_intersection{
             let mut seen = HashSet::new();
 
             for (keyname, keyvalue) in key_map {
+
                 if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
                     if let Some(val_map) = ptrmap.get(keyname) {
-                        if let Some(ptrs) = val_map.get(keyvalue) {
-                            for ptr in ptrs {
-                                let key = ptr.as_ptr(); // Use raw pointer for uniqueness
-                                if seen.insert(key) {
-                                    result.push(ptr.clone());
+                        if(keyvalue.starts_with(&self.settings.notoperator)){
+                            let newkeyvalue 
+                                = keyvalue.strip_prefix(&self.settings.notoperator).unwrap_or(keyvalue);
+                            for (key1, vec1) in val_map {
+                                if key1 != &NumKey(newkeyvalue.into())  {
+                                    for ptr1 in vec1 {
+                                        let rawptr1 = ptr1; // Use raw pointer for uniqueness
+                                        if seen.insert(rawptr1) {
+                                            result.push(ptr1.clone());
+                                        }
+                                    }
                                 }
                             }
                         }
+                        else if(keyvalue.starts_with("min()"))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+
+                            if let Some((max_key, last_vals)) = val_map.iter().next() {
+                                results_vec.extend_from_slice(last_vals);
+                            }                            
+
+                            //find union of results_vec and result
+                            let mut seen: HashSet<_> = result.iter().copied().collect();
+                            for val in results_vec {
+                                if seen.insert(val) { // insert returns false if already present
+                                    result.push(val);
+                                }
+                            }
+
+                        }
+                        else if(keyvalue.starts_with("max()"))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+
+                            if let Some((max_key, last_vals)) = val_map.iter().next_back() {
+                                results_vec.extend_from_slice(last_vals);
+                            }                            
+
+                            //find union of results_vec and result
+                            let mut seen: HashSet<_> = result.iter().copied().collect();
+                            for val in results_vec {
+                                if seen.insert(val) { // insert returns false if already present
+                                    result.push(val);
+                                }
+                            }
+
+                        }
+                        else if(keyvalue.starts_with(">")
+                                 ||
+                                 keyvalue.starts_with("<")
+                                 ||
+                                 keyvalue.starts_with(">=")
+                                 ||
+                                 keyvalue.starts_with("<="))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+                            let count_pipe = keyvalue.matches('|').count();
+
+                            match count_pipe {
+                                0 => {
+                                    // No '|' → process directly
+                                    results_vec = self.filterOnRange(keyvalue.trim(),val_map);
+                                }
+                                1 => {
+                                    // Exactly one '|'
+                                    let parts: Vec<&str> = keyvalue.split('|').collect();
+                                    let mut results_vec1 = self.filterOnRange(parts[0].trim(),val_map);
+                                    let mut results_vec2 =self.filterOnRange(parts[1].trim(),val_map);
+
+                                    //find intersections of above
+                                    results_vec = self.intersection_unique_unordered(&results_vec1, &results_vec2);
+
+                                }
+                                _ => {
+                                    // More than one '|' → invalid format
+                                    eprintln!("Error: '|' can appear only once in '{}'", keyvalue);
+                                }
+                            }
+
+                            //find union of results_vec and result
+                            let mut seen: HashSet<_> = result.iter().copied().collect();
+                            for val in results_vec {
+                                if seen.insert(val) { // insert returns false if already present
+                                    result.push(val);
+                                }
+                            }
+
+                        }
+                        else if(keyvalue.contains(",")){
+                            for newkeyvalue in keyvalue.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                                if let Some(ptrs) = val_map.get(&NumKey(newkeyvalue.into()) ) {
+                                    for ptr in ptrs {
+                                        let key = ptr; // Use raw pointer for uniqueness
+                                        if seen.insert(key) {
+                                            result.push(ptr.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }                        
+                        else{
+                            if let Some(ptrs) = val_map.get(&NumKey(keyvalue.into()) ) {
+                                for ptr in ptrs {
+                                    let key = ptr; // Use raw pointer for uniqueness
+                                    if seen.insert(key) {
+                                        result.push(ptr.clone());
+                                    }
+                                }
+                            }
+                        }
+
                     }
                 }
+
             }
 
         }
@@ -1712,7 +2239,138 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             for (keyname, keyvalue) in key_map {
                 if let Some(ptrmap) = self.file_key_pointer_map.get(file_name) {
                     if let Some(val_map) = ptrmap.get(keyname) {
-                        if let Some(ptrs) = val_map.get(keyvalue) {
+                        if(keyvalue.starts_with(&self.settings.notoperator)){
+                            let newkeyvalue 
+                                = keyvalue.strip_prefix(&self.settings.notoperator).unwrap_or(keyvalue);
+                            
+                            let mut ptrsfound =false;
+                            for (key1, vec1) in val_map {
+
+                                if key1 != &NumKey(newkeyvalue.into()) {
+
+
+                                    if is_first {
+                                        result = vec1.iter().cloned().collect();
+                                        is_first = false;
+                                    } else {
+                                        result.retain(|ptr| {
+                                            vec1.iter().any(|p| p == ptr)
+                                        });
+
+                                    }
+                                    ptrsfound = true;  
+                                }                               
+
+                            }
+                            if(!ptrsfound){
+                                result.clear();
+                            }
+                            if result.is_empty() {
+                                break; // Intersection became empty -> stop
+                            }
+
+                        }
+                        else if(keyvalue.starts_with("min()"))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+
+                            if let Some((max_key, last_vals)) = val_map.iter().next() {
+                                results_vec.extend_from_slice(last_vals);
+                            }                            
+
+                            //now find intersection
+                            if is_first {
+                                result = results_vec.clone();
+                                is_first = false;
+                            }
+                            else{
+                                result = self.intersection_unique_unordered(&results_vec, &result);
+                            } 
+
+                        }
+                        else if(keyvalue.starts_with("max()"))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+
+                            if let Some((max_key, last_vals)) = val_map.iter().next_back() {
+                                results_vec.extend_from_slice(last_vals);
+                            }                            
+
+                            //now find intersection
+                            if is_first {
+                                result = results_vec.clone();
+                                is_first = false;
+                            }
+                            else{
+                                result = self.intersection_unique_unordered(&results_vec, &result);
+                            } 
+
+                        }
+                        else if(keyvalue.starts_with(">")
+                                 ||
+                                 keyvalue.starts_with("<")
+                                 ||
+                                 keyvalue.starts_with(">=")
+                                 ||
+                                 keyvalue.starts_with("<="))
+                        {
+                            let mut results_vec: Vec<usize> = Vec::new();
+                            let count_pipe = keyvalue.matches('|').count();
+
+                            match count_pipe {
+                                0 => {
+                                    // No '|' → process directly
+                                    results_vec = self.filterOnRange(keyvalue.trim(),val_map);
+                                }
+                                1 => {
+                                    // Exactly one '|'
+                                    let parts: Vec<&str> = keyvalue.split('|').collect();
+                                    let mut results_vec1 = self.filterOnRange(parts[0].trim(),val_map);
+                                    let mut results_vec2 =self.filterOnRange(parts[1].trim(),val_map);
+
+                                    //find intersections of above
+                                    results_vec = self.intersection_unique_unordered(&results_vec1, &results_vec2);
+
+                                }
+                                _ => {
+                                    // More than one '|' → invalid format
+                                    eprintln!("Error: '|' can appear only once in '{}'", keyvalue);
+                                }
+                            }
+
+                            //now find intersection
+                            if is_first {
+                                result = results_vec.clone();
+                                is_first = false;
+                            }
+                            else{
+                                result = self.intersection_unique_unordered(&results_vec, &result);
+                            } 
+
+                        }
+                        else if(keyvalue.contains(",")){
+                            let mut seen = HashSet::new();
+                            let mut resultForOr: Vec<usize> = Vec::new(); // ✅ Flat vector
+                            for newkeyvalue in keyvalue.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                                if let Some(ptrs) = val_map.get(&NumKey(newkeyvalue.into()) ) {
+                                    for ptr in ptrs {
+                                        let key = ptr; // Use raw pointer for uniqueness
+                                        if seen.insert(key) {
+                                            resultForOr.push(ptr.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            //now find intersection
+                            if is_first {
+                                result = resultForOr.clone();
+                                is_first = false;
+                            }
+                            else{
+                                result = self.intersection_unique_unordered(&resultForOr, &result);
+                            }                             
+                        }
+                        else if let Some(ptrs) = val_map.get(&NumKey(keyvalue.into()) ) {
                             if ptrs.is_empty() {
                                 result.clear(); // Found empty ptrs -> clear result
                                 break;
@@ -1722,7 +2380,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                                 is_first = false;
                             } else {
                                 result.retain(|ptr| {
-                                    ptrs.iter().any(|p| p.as_ptr() == ptr.as_ptr())
+                                    ptrs.iter().any(|p| p == ptr)
                                 });
                                 if result.is_empty() {
                                     break; // Intersection became empty -> stop
@@ -1742,20 +2400,17 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 }
             }
         }
-
         if(reverse){
-            result.sort_by_key(|ptr| std::cmp::Reverse(ptr.as_ptr() as usize));
+            result.sort_by(|a, b| b.cmp(a));
         }
         else{
-            result.sort_by_key(|ptr| ptr.as_ptr() as usize);
+            result.sort();
         }
-
         let mut result_lines: Vec<String> = Vec::with_capacity(self.settings.maxgetrecords + 1);
         //add meta data
         let total_records = result.len(); // your value
         let meta_json_str = format!(r#"{{"meta":{{"total_count":{}}}}}"#, total_records);
         result_lines.push(meta_json_str.clone());
-
         let mut actualreccound : usize = 0;
 
         let mut recordsadded: usize = 0;
@@ -1763,7 +2418,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
 
         for ptr in result {
 
-            if let Ok(line) = self.print_line_forpointer(ptr,includedelete) {
+            if let Ok(line) = self.print_line_forpointer_uselen(file_name,ptr,includedelete) {
 
                 let line = line.trim();
                 if line.is_empty() {
@@ -1786,6 +2441,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
                 }
             }
         }
+
         //reset count
         result_lines[0] = format!(r#"{{"meta":{{"total_count":{}}}}}"#, actualreccound);
 
@@ -1804,18 +2460,19 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         &self,
         file_name: &str,
         key_map: &HashMap<String, String>,
-    ) -> Option<Vec<*mut u8>> {
+    ) -> Option<Vec<usize>> {
         // Step 1: Gather all pointer lists for each keyname-value pair
-        let mut sets: Vec<HashSet<&PtrWrapper>> = Vec::new();
+        let mut sets: Vec<HashSet<usize>> = Vec::new();
 
         for (keyname, keyvalue) in key_map {
-            let ptrs = self.file_key_pointer_map
-                .get(file_name)?
-                .get(keyname)?
-                .get(keyvalue)?
-                .iter()
-                .clone()
-                .collect::<HashSet<_>>();
+            let ptrs: HashSet<usize> = self
+                .file_key_pointer_map
+                .get(file_name)?      // -> &HashMap<_, Vec<usize>>
+                .get(keyname)?        // -> &Vec<usize>
+                .get(&NumKey(keyvalue.into()) )?       // -> &Vec<usize>
+                .iter()               // -> Iterator<Item=&usize>
+                .copied()             // -> Iterator<Item=usize>
+                .collect();           // -> HashSet<usize>
 
             sets.push(ptrs);
         }
@@ -1831,9 +2488,64 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         if common_ptrs.is_empty() {
             None
         } else {
-            Some(common_ptrs.into_iter().map(|pw| pw.as_ptr()).collect())
+            Some(common_ptrs.into_iter().collect())
         }
     }
+
+    pub fn extract_prim_keyname_value_map(&self, json: &Value) -> std::io::Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
+
+        let key_field = json.get("primkey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing or invalid 'primkey' field",
+            ))?;
+
+        for keyname in key_field.split(',').map(str::trim) {
+            if keyname.is_empty() {
+                continue;
+            }
+
+            let value_opt = json.get(keyname).or_else(|| self.find_key_recursively(json, keyname));
+
+            if let Some(value) = value_opt {
+                let value_str = match value {
+                    Value::String(s) => s.clone(),
+                    _ => value.to_string().trim_matches('"').to_string(),
+                };
+                //do reverse replacement
+                let mut key_t = keyname.to_string();
+                if(key_t.contains(self.settings.indexnamevaluedelimiter)){
+                    key_t = key_t.replace(self.settings.indexnamevaluedelimiter,&self.settings.repindexnamevaluedelimiter.to_string());
+                }
+                if(key_t.contains(self.settings.indexdelimiter)){
+                    key_t = key_t.replace(self.settings.indexdelimiter,&self.settings.repindexdelimiter.to_string());
+                }
+                if(key_t.contains(self.settings.recorddelimiter)){
+                    key_t = key_t.replace(self.settings.recorddelimiter,&self.settings.reprecorddelimiter.to_string());
+                }
+                let mut value_str_t = value_str.to_string();
+                if(value_str_t.contains(self.settings.indexnamevaluedelimiter)){
+                    value_str_t = value_str_t.replace(self.settings.indexnamevaluedelimiter,&self.settings.repindexnamevaluedelimiter.to_string());
+                }
+                if(value_str_t.contains(self.settings.indexdelimiter)){
+                    value_str_t = value_str_t.replace(self.settings.indexdelimiter,&self.settings.repindexdelimiter.to_string());
+                }
+                if(value_str_t.contains(self.settings.recorddelimiter)){
+                    value_str_t = value_str_t.replace(self.settings.recorddelimiter,&self.settings.reprecorddelimiter.to_string());
+                }
+                map.insert(key_t, value_str_t);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Key '{}' not found in JSON", keyname),
+                ));
+            }
+        }
+
+        Ok(map)
+    }    
 
     pub fn extract_keyname_value_map(&self, json: &Value) -> std::io::Result<HashMap<String, String>> {
         let mut map = HashMap::new();
@@ -1946,6 +2658,8 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         Local::now().format("%d-%m-%y-%H-%M-%S-%6f").to_string()
     } 
 
+
+
     pub fn handle_request(&mut self, input: &str) -> std::io::Result<Vec<String>> {
         let parsed: Value = serde_json::from_str(input).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid JSON: {e}"))
@@ -1986,6 +2700,10 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
             }
             "delete" => {
                 self.delete(&data_str)?;
+                ok_response()
+            }
+            "undo" => {
+                self.undo(&data_str)?;
                 ok_response()
             }
             "gethist" => self.gethist(&data_str),
@@ -2044,6 +2762,8 @@ fn run() -> io::Result<()> {
     handler.delete(json_input);
     handler.getall(json_input_get1);
     handler.get(json_input_get1);
+    //new operator : undo
+    handler.undo(json_input);
 
     let duration = start.elapsed();
     println!("Time taken: {:.2?}", duration);

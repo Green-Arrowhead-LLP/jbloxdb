@@ -24,7 +24,11 @@ use std::fs::File;
 use std::path::Path;
 use std::process::exit;
 
+use memmap2::{MmapMut};
+
 use chrono::Local; // <-- add this at top of file
+use std::io::{ErrorKind};
+
 
 // Represents the cursor's position within the visible viewport
 use crossterm::{
@@ -185,59 +189,88 @@ fn index_lines_batch(
     starting_line_num: usize,
     char_size: usize,
 ) -> io::Result<usize> {
+    // 1) mmap entire file read-only
     let mmap: memmap2::Mmap = unsafe { MmapOptions::new().map(file)? };
-
-    let mut offset = start_offset;
-    let mut current_line = starting_line_num;
     let file_len = mmap.len();
 
-    'outer: for _ in 0..batch_size {
+    let mut offset = start_offset;
+    let mut line_num = starting_line_num;
+
+    // how many characters wide is your size field?
+    let size_field_chars = 7;
+    let size_field_bytes = size_field_chars * char_size;
+    let mut counter : u32 = 0;
+    for _ in 0..batch_size {
         if offset >= file_len {
-            break; // EOF reached
+            break; // EOF
         }
 
+        // record starts here
         let line_start = offset;
-        let mmap_slice = &mmap[offset..];
-        let mut idx = 0;
-        let mut rel_end_option = None;
 
-        while idx + char_size <= mmap_slice.len() {
-            if char_size == 2 {
-                // UCS-2: read 2 bytes at a time
-                let u16_val = u16::from_le_bytes([
-                    mmap_slice[idx],
-                    mmap_slice[idx + 1]
-                ]);
-                if u16_val == 0x000A {
-                    rel_end_option = Some(idx + 2); // include newline (2 bytes)
-                    break;
-                }
-            } else {
-                // ASCII: single byte newline
-                if mmap_slice[idx] == b'\n' {
-                    rel_end_option = Some(idx + 1);
-                    break;
-                }
-            }
-            idx += char_size;
+        // compute slice indices for the size‐field
+        let field_start = line_start + 22 * char_size;
+        let field_end   = field_start + size_field_bytes;
+
+        // make sure we don’t overrun
+        if field_end > file_len {
+            eprintln!(
+                "⚠️ size header at {}…{} out of bounds (file len {})",
+                field_start, field_end, file_len
+            );
+            break;
         }
 
-        if let Some(rel_end) = rel_end_option {
-            let line_end = offset + rel_end;
-            let line_len = rel_end; // already correct length in bytes
+        // grab exactly the size‐field bytes
+        let header_bytes = &mmap[field_start .. field_end];
 
-            line_ptr_map.insert(current_line, line_start);
-            line_len_map.insert(current_line, line_len);
-
-            offset = line_end;
-            current_line += 1;
+        // decode to a digit-string
+        let digits: String = if char_size == 2 {
+            // UCS-2: map low bytes to chars, stop at first non-digit
+            header_bytes
+                .chunks(2)
+                .map(|pair| pair[0] as char)
+                .take_while(|c| c.is_ascii_digit())
+                .collect()
         } else {
-            println!("⚠️ Stopping at offset {} (line {})", offset, current_line);
-            break; // exit outer loop
-        }
-    }
-    drop(mmap);
+            // ASCII: grab the UTF-8 & stop at first non-digit
+            std::str::from_utf8(header_bytes)
+                .expect("invalid UTF-8 in size header")
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect()
+        };
 
+        // if we didn’t get exactly size_field_chars digits, it wasn’t all numeric:
+        if digits.len() != size_field_chars {
+            eprintln!(
+                "⚠️  size header contains non-numeric at offset {}…{}: {:?}",
+                field_start, field_end, digits,
+            );
+            break ;
+        }
+
+        counter +=1;
+        // parse the total byte‐length of this record
+        let record_len: usize = digits
+            .parse()
+            .expect("size header not numeric");
+
+        // compute the next offset (just past this record)
+        let next_offset = line_start + record_len;
+
+
+        // insert into your maps
+        line_ptr_map.insert(line_num, line_start);
+        line_len_map.insert(line_num, record_len);
+
+        // advance to the next record
+        offset = next_offset;
+        line_num += 1;
+
+    }
+
+    // return the offset you stopped at
     Ok(offset)
 }
 
@@ -409,9 +442,13 @@ fn main() -> io::Result<()> {
                 = unsafe { MmapOptions::new().len(file_size as usize).map_mut(&file)? };
 
 
-    let mut mmap = unsafe { MmapOptions::new().len(file_size as usize).map_anon()? };
+    //let mut mmap = unsafe { MmapOptions::new().len(file_size as usize).map_anon()? };
 
-    mmap.copy_from_slice(&mmap_file);
+    // 2) Create a private (MAP_PRIVATE) staging map
+    //    writes here are never visible to the file on disk
+    let mut mmap: MmapMut = unsafe {MmapOptions::new().map_copy(&file)? };    
+
+    //mmap.copy_from_slice(&mmap_file);
 
     let mut offset = 0;
     let mut line_num = 0;
@@ -1263,19 +1300,29 @@ for row in 0..view_height {
                     (KeyCode::Char('s'), modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        //copy from mmap to mmap_file
-                        mmap_file.copy_from_slice(&mmap);
-                        
-                        mmap_file.flush().expect("Failed to save changes");
-                        //println!("All changes saved.                            ");
+                        //use modified_line_map to write to mmap_file
+                        for (line_num, new_text) in &modified_line_map {
+                            //use line_ptr_map to get offset
+                            let start_byte = line_ptr_map[&line_num];
+                            let size_bytes = line_len_map[&line_num];
 
-                        mmap = unsafe {
-                            memmap2::MmapOptions::new()
-                                .len(file_size as usize)
-                                .map_anon()?
-                        };
-
-                        mmap.copy_from_slice(&mmap_file);
+                            for (i, c) in new_text.chars().enumerate() {
+                                let code = c as u32;
+                                if code > 0xFFFF {
+                                    return Err(io::Error::new(
+                                        ErrorKind::InvalidInput,
+                                        format!("char {} (U+{:X}) is out of UCS-2 range", i, code),
+                                    ));
+                                }                                
+                                let u = code as u16;
+                                let [lo, hi] = u.to_le_bytes();
+                                let pos = start_byte + i * 2;
+                                mmap_file[pos]     = lo;
+                                mmap_file[pos + 1] = hi;
+                            }
+                            mmap_file.flush()?;
+                            // you can read `line_num: &usize` and `new_text: &String` here
+                        }
 
                         // --- Write to history file ---
                         writeln!(history_file, "\n=== Saved at {} ===\n", Local::now().format("%Y-%m-%d %H:%M:%S"))?;

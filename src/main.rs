@@ -142,6 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let request = String::from_utf8_lossy(&buffer[..n]);
             //println!("Request:\n{}", request);
 
+            // Parse the request line, e.g. "GET /foo.html HTTP/1.1"
+
+
             // Check if the request is a POST
             if request.starts_with("POST") {
                 // Find where the headers end and body begins
@@ -249,24 +252,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // For GET or other methods, serve a static HTML file
-                match fs::read_to_string(format!("{}/{}", htmldir, defaultpage)) {
-                    Ok(html) => {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n{}",
-                            html.len(),
-                            html
-                        );
-                        let _ = socket.write_all(response.as_bytes()).await;
-                    }
+                let req_line = request.lines().next().unwrap_or("");
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                // Decide which file to serve: "/" → defaultpage, otherwise strip the leading '/'
+                let page: &str  = if path == "/" {
+                    &defaultpage
+                } else {
+                    &path[1..]  
+                };
+                // Build the filesystem path and try to read it
+                let requested = Path::new(&htmldir).join(page);
+                
+                // 2) Decide which file to read based on existence
+                let target = if requested.exists() {
+                    requested
+                } else {
+                    Path::new(&htmldir).join(defaultpage)
+                };
+
+                let html = match std::fs::read_to_string(&target) {
+                    Ok(s) => s,
                     Err(e) => {
-                        let response = format!(
-                            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{}",
-                            e.to_string().len(),
-                            e
-                        );
-                        let _ = socket.write_all(response.as_bytes()).await;
+                        eprintln!("Failed to read {}: {}", target.display(), e);
+                        return;       // this returns from your async block (which is `()`), no `?` needed
                     }
-                }
+                };
+
+                // now send the HTTP response
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Content-Type: text/html\r\n\r\n\
+                    {}",
+                    html.len(),
+                    html
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+
             }
         });
     }

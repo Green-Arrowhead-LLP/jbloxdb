@@ -30,6 +30,8 @@ use std::sync::{atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
+use crossterm::terminal;
+
 #[derive(Clone,Debug, Deserialize)]
 struct Settings {
     ip: String,
@@ -43,6 +45,8 @@ struct Settings {
 
 
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    print_jbloxDB();
+    println!("Starting jbloxDB: zero configuration; super fast JSON database.");
 
     //check .lck file so at to make sure that only on instance is running
     // Check for jblox.lck file
@@ -60,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_clone = shutting_down.clone();
 
     let config_path = get_config_path();
-    println!("Config file path for jbloxdb http wrapper: {}",config_path.to_str().unwrap());
+
     let config = Config::builder()
         .add_source(config::File::with_name(config_path.to_str().unwrap()))
         .build()
@@ -73,7 +77,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("htmldir dir: {}",settings.htmldir);
     // Create a thread-safe shared instance of jbothandler wrapped in Arc and Mutex
-    let handler = Arc::new(Mutex::new(jbothandler::new().unwrap()));
+    // 1) create the handler
+    let mut handler = jbothandler::new().unwrap();
+    //check data integrity
+    handler.sanitycheck();
+    println!("Ready to accept requests.");
+
+
+    let handler = Arc::new(Mutex::new(handler));
+
 
     // Bind the TCP listener to localhost at port 3000
     let listener = TcpListener::bind(format!("{}:{}", settings.ip, settings.port)).await?;
@@ -198,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Call handler logic and build a JSON response
                                         let result: Result<Vec<String>, std::io::Error> 
                                             = h.handle_request(&json.to_string());
+
 
                                         response_body = match result {
                                             Ok(lines) => {
@@ -329,4 +342,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: Could not find 'config/settings.toml' in current or any parent directory.");
         process::exit(1);
     }
+
+pub fn print_jbloxDB() {
+    // 7 rows × 8 cols per glyph; rows use the letter itself (no '#').
+    // Lowercase 'o' and 'x' are intentionally shorter (x-height),
+    // so they don't look like capitals next to D/B.
+    fn glyph(c: char) -> [&'static str; 9] {
+        match c {
+            // ----- lowercase -----
+            'j' => [
+                "    j   ",
+                "        ",
+                "    j   ",
+                "    j   ",
+                "    j   ",
+                "    j   ",
+                "j   j   ",
+                "j   j   ",
+                " jjj    ",
+            ],
+            'b' => [
+                "b       ",
+                "b       ",
+                "b bbb   ",
+                "bb   b  ",
+                "b    b  ",
+                "bb   b  ",
+                "b bbb   ",
+                "        ",
+                "        ",
+            ],
+            'l' => [ // simple lowercase 'l' (no baseline bar)
+                "l ",
+                "l ",
+                "l ",
+                "l ",
+                "l ",
+                "l ",
+                "l ",
+                "  ",
+                "  ",
+            ],
+            // lowercase 'o' at x-height (shorter than capitals)
+            'o' => [
+                "        ",
+                "        ",
+                "  ooo   ",
+                " o   o  ",
+                " o   o  ",
+                " o   o  ",
+                "  ooo   ",
+                "        ",
+                "        ",
+            ],
+            // lowercase 'x' at x-height
+            'x' => [
+                "        ",
+                "        ",
+                " x   x  ",
+                "  x x   ",
+                "   x    ",
+                "  x x   ",
+                " x   x  ",
+                "        ",
+                "        ",
+            ],
+
+            // ----- uppercase -----
+            'D' => [
+                "DDDDD   ",
+                "D    D  ",
+                "D     D ",
+                "D     D ",
+                "D     D ",
+                "D    D  ",
+                "DDDDD   ",
+                "        ",
+                "        ",
+            ],
+            'B' => [
+                "BBBBB   ",
+                "B    B  ",
+                "B    B  ",
+                "BBBBB   ",
+                "B    B  ",
+                "B    B  ",
+                "BBBBB   ",
+                "        ",
+                "        ",
+            ],
+            _ => ["        "; 9],
+        }
+    }
+
+    // Exact text & case as requested.
+    let text: [char; 7] = ['j','b','l','o','x','D','B'];
+
+    // Build rows
+    let mut rows: [String; 9] = Default::default();
+    for r in 0..9 {
+        let mut line = String::new();
+        for &ch in &text {
+            line.push_str(glyph(ch)[r]);
+            line.push(' '); // spacing
+        }
+        while line.ends_with(' ') { line.pop(); }
+        rows[r] = line;
+    }
+
+    // Border with padding
+    let pad = 1usize;
+    let content_w = rows.iter().map(|s| s.len()).max().unwrap_or(0);
+    let inner_w = content_w + pad * 2;
+    
+    // --- ADDED: terminal fit check (skip printing if it won't fit) ---
+    let total_width  = inner_w + 2;              // side borders
+    let total_height = rows.len() + 2;           // top+bottom borders
+    if let Ok((cols, rows_term)) = terminal::size() {
+        let cols = cols as usize;
+        let rows_term = rows_term as usize;
+        if total_width > cols || total_height > rows_term {
+            return; // do not display if it won't fit
+        }
+    } else {
+        return; // fail closed if we can't read terminal size
+    }
+    // -----------------------------------------------------------------
+
+    println!("+{}+", "-".repeat(inner_w));
+    for row in rows {
+        let mut padded = String::new();
+        padded.push_str(&" ".repeat(pad));
+        padded.push_str(&row);
+        if padded.len() < inner_w {
+            padded.push_str(&" ".repeat(inner_w - padded.len()));
+        }
+        println!("|{}|", padded);
+    }
+    println!("+{}+", "-".repeat(inner_w));
+}
+
+
 

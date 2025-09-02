@@ -10,7 +10,7 @@
 #that you expect not to out grow soon. You will have to restart
 #jbloxDB if file size is reached. jbloxDB might restart on its own
 #if jbloxDB is not started by the admin.
-initfilesize = "10;issues:100;comment:100;session:100" 
+initfilesize = "800;issues:1;comment:1;session:1;usersalary_large_forTest:2000" 
 
 #once file size reaches initfilesize, jbloxDB increases size by this
 #multiple, for the first time and thereafter everytime it reaches the
@@ -70,3 +70,9 @@ MADVISE_CHUNK = 4
 low_ram_mode = false
 
 notoperator = "!"
+
+#sanity check time goback time in seconds
+sanitycheckgobacksec = 300
+
+#debugmode
+debugmode = false

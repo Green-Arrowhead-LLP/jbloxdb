@@ -2179,7 +2179,7 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
                 self.log_message(&format!("{}-0-()-I-{}", timestamp,"Invalid or missing 'key/primkey'"))?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Invalid or missing 'key' or key value in JSON",
+                    "Invalid or missing 'key/primkey' in JSON",
                 ));
             }
         } else {

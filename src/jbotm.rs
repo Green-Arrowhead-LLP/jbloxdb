@@ -60,7 +60,7 @@ use std::sync::{MutexGuard};
 
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, indexmap};
 
 type Ts  = String;
 type Ptr = usize;
@@ -222,6 +222,7 @@ pub struct Settings {
     notoperator: String,
     sanitycheckgobacksec: usize,
     debugmode: bool,
+    strongdurablemode: bool,
 
 } 
 pub struct jbothandler {
@@ -235,6 +236,7 @@ pub struct jbothandler {
     datadir: String,
     logdir: String,
     log_file: BufWriter<File>,
+    errorlog_file: BufWriter<File>,
     log_line_count : usize,
     state: Arc<Mutex<SharedState>>,
     stateR: Arc<Mutex<SharedStateR>>,
@@ -939,7 +941,14 @@ pub fn load_existing_file(
             let recptr = offset;
 
             lines.insert(recptr, record_len);
-            key_lines.insert(recptr, key_record_len);
+            //deleted records have ADD_TOMARK_REC_DELETE_IN_RECORDKEY added
+            //to key length
+            if(!is_zero){
+                key_lines.insert(recptr, key_record_len + ADD_TOMARK_REC_DELETE_IN_RECORDKEY);
+            }
+            else{
+                key_lines.insert(recptr, key_record_len);
+            }            
 
             // key field text (UTF-16)
             let keystr_start = reckey_size_end + 1 * 2;
@@ -1115,10 +1124,22 @@ pub fn new() -> io::Result<Self> {
     let mut log_line_count: usize = 0;
 
     let log_filename = format!("{}/jblox.log", logdir);
+
+    //everytime jbloxdb start, new error file will be created
+    let errlog_filename = format!(
+        "{}/jblox_error-{}.log",
+        logdir,
+        Local::now().format("%Y%m%d-%H%M%S") // e.g., 20250903-002530
+    );
+    
     println!("log_filename: {}", log_filename);
     let log_file = BufWriter::new(
         OpenOptions::new().create(true).append(true).open(&log_filename)?
     );
+    
+    let errorlog_file = BufWriter::new(
+        OpenOptions::new().create(true).append(true).open(&errlog_filename)?
+    );    
     let log_path = std::path::Path::new(&log_filename);
     if log_path.exists() {
         if let Ok(logfileforlines) = File::open(log_path) {
@@ -1240,6 +1261,7 @@ pub fn new() -> io::Result<Self> {
         datadir,
         logdir,
         log_file,
+        errorlog_file,
         log_line_count,
         state,
         stateR,
@@ -1948,7 +1970,28 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
 
     mm[start..end].copy_from_slice(line_bytes);
     
-    self.log_message(&format!("{}-0-{}-I", timestamp,start))?;
+    if(self.settings.strongdurablemode){
+        if let Err(e) = mm.flush() {
+            // best-effort log; ignore logging failure to preserve current flow
+            let _ = self.log_error_message(&format!(
+                "{}-{}-FLUSH-{}-ERR kind={:?} os={:?} msg={}",
+                timestamp,
+                file_name,
+                new_line.clone(),
+                e.kind(),
+                e.raw_os_error(),
+                e
+            ));
+        }
+        else{
+            self.log_message(&format!("{}-0-{}-I", timestamp,start))?;
+        }   
+    }
+    else{
+        self.log_message(&format!("{}-0-{}-I", timestamp,start))?;
+
+    }
+
 
     // Update in-memory indexes
     self.file_size_map.insert(file_name.to_string(),end.clone());
@@ -2007,12 +2050,8 @@ pub fn print_line_forpointer_uselen(
             format!("missing pointer entry at {}", start_ptr_addr),
         )
     })?;
-    //for deleted records length is incremented, so handle that
-    if(reclength > ADD_TOMARK_REC_DELETE_IN_RECORDKEY){
-        reclength = reclength - ADD_TOMARK_REC_DELETE_IN_RECORDKEY
 
-    }
-    
+   
     // Get Arc<Mmap> for this file under a short map read-lock, then drop all locks
     let mmap_arc: std::sync::Arc<Mmap> = {
         let stateR = self.stateR.lock().unwrap();
@@ -2560,11 +2599,17 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         }
        
         let ptrcount = ptrs.len();
-        for ptr in &ptrs {
-            self.log_message(&format!("{}-1-{}-T-D-{}", timestamp,ptr,ptrcount))?;
+        if(ptrcount > 0){
+            for ptr in &ptrs {
+                self.log_message(&format!("{}-1-{}-T-D-{}", timestamp,ptr,ptrcount))?;
+            }
+        
+            self.delete_using_pointerVector(file_name, ptrs.clone(),"d".to_string(),timestamp);
         }
-      
-        self.delete_using_pointerVector(file_name, ptrs.clone(),"d".to_string(),timestamp);
+        else{
+                self.log_message(&format!("{}-0-0-D-{}", timestamp,"Record_Not_found"))?;
+        }
+
 
         let lines = vec![
             String::from("done")
@@ -2597,10 +2642,23 @@ pub fn delete_using_pointerVector(&mut self,
         }
 
         for ptr in &ptrs {
-                mm[*ptr]     = indicatorchar;
-                mm[*ptr + 1] = 0x00;
-                let _ = mm.flush(); // keep same behavior as before (ignore result)
+            mm[*ptr]     = indicatorchar;
+            mm[*ptr + 1] = 0x00;
+            if let Err(e) = mm.flush() {
+                // best-effort log; ignore logging failure to preserve current flow
+                let _ = self.log_error_message(&format!(
+                    "{}-{}-FLUSH-{}-ERR kind={:?} os={:?} msg={}",
+                    timestamp,
+                    file_name,
+                    *ptr,
+                    e.kind(),
+                    e.raw_os_error(),
+                    e
+                ));
+            }
+            else{
                 self.log_message(&format!("{}-0-{}-D", timestamp,*ptr));
+            }
 
         }
 
@@ -2611,7 +2669,9 @@ pub fn delete_using_pointerVector(&mut self,
     let key_lines = self.file_key_line_map.get_mut(file_name).unwrap();
     for ptr in &ptrs {
         if let Some(old) = key_lines.get(ptr).cloned() {
-            key_lines.insert(ptr.clone(), old + ADD_TOMARK_REC_DELETE_IN_RECORDKEY);
+            if(old < ADD_TOMARK_REC_DELETE_IN_RECORDKEY){
+                key_lines.insert(ptr.clone(), old + ADD_TOMARK_REC_DELETE_IN_RECORDKEY);
+            }
         } 
     }    
 
@@ -2651,7 +2711,7 @@ pub fn delete_using_pointerVector(&mut self,
                 .ok_or("ptr not found")?;
 
             // correct the size if record marked as deleted
-            if key_record_len > ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
+            if key_record_len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
                 key_record_len = key_record_len - ADD_TOMARK_REC_DELETE_IN_RECORDKEY;
             }
 
@@ -2903,12 +2963,6 @@ pub fn delete_using_pointerVector(&mut self,
             
             if(deletesuccess){
                 self.insert_duplicate_frmObject(&origjson, timestamp);
-                self.log_message(&format!("{}-0-{}-I", timestamp,restore_ptr))?;
-            }
-            else{
-                self.log_message(&format!("{}-0-{}-D-{}", timestamp,restore_ptr,errmsg))?;
-                self.log_message(&format!("{}-0-0-I", timestamp))?;
-
             }
 
 
@@ -2941,14 +2995,11 @@ pub fn delete_using_pointerVector(&mut self,
         let mut key_map: IndexMap<String, String> = IndexMap::new();
         
         //Step 4 A: Extract primary_key-value map from json
-        //primary key is optional in update
 
         if json.get("primkey").is_some(){
-            let u_key_map: IndexMap<String, String> = self.extract_prim_keyname_value_map(&json)?;
-            for (k, v) in u_key_map {
-                key_map.entry(k).or_insert(v);
-            }            
+            key_map = self.extract_prim_keyname_value_map(&json)?;
         }
+
         if(key_map.len() == 0){
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2988,37 +3039,39 @@ pub fn delete_using_pointerVector(&mut self,
 
 
         }
-        for ptr in &ptrs {
-            self.log_message(&format!("{}-1-{}-T-D-I-{}", timestamp,ptr,ptrs.len()))?;
+        let ptrsize = ptrs.len();
 
-        }
-        self.delete_using_pointerVector(file_name, ptrs.clone(),"u".to_string(), timestamp);
-
-        for &ptr in &ptrs {
-            let origrec = self.print_line_forpointer_uselen(file_name,ptr,true)?;
-            //exract json data
-            let origjson = extract_json(&origrec,self.settings.recorddelimiter);
-            if(!origjson.is_null()){
-                let mut i_key_map: IndexMap<String, String> = key_map.clone();
-
-                if origjson.get("primkey").is_some(){
-                    let primkey_map: IndexMap<String, String> = self.extract_prim_keyname_value_map(&origjson)?;
-                    for (k, v) in primkey_map {
-                        i_key_map.entry(k).or_insert(v);
-                    }            
-                }
-                //primary key also cannot be changed
-                i_key_map.entry("primkey".to_string()).or_insert("".to_string());   
-                let key_set: HashSet<&str> = i_key_map.keys().map(|s| s.as_str()).collect();
-
-                let modjson: Value = json.clone();
-
-                //merge json (update json) with orig json data
-                let mergedjson = merge(&origjson, &modjson,&key_set);
-                //insert merged json 
-                self.insert_duplicate_frmObject(&mergedjson, timestamp);  
+        if(ptrsize > 0){
+            for ptr in &ptrs {
+                self.log_message(&format!("{}-1-{}-T-D-I-{}", timestamp,ptr,ptrsize))?;
 
             }
+            self.delete_using_pointerVector(file_name, ptrs.clone(),"u".to_string(), timestamp);
+
+            for &ptr in &ptrs {
+                let origrec = self.print_line_forpointer_uselen(file_name,ptr,true)?;
+                //exract json data
+                let origjson = extract_json(&origrec,self.settings.recorddelimiter);
+                if(!origjson.is_null()){
+                    let mut i_key_map: IndexMap<String, String> = self.extract_prim_keyname_value_map(&origjson)?;
+                  
+                    //primary key also cannot be changed
+                    i_key_map.entry("primkey".to_string()).or_insert("".to_string());   
+                    let key_set: HashSet<&str> = i_key_map.keys().map(|s| s.as_str()).collect();
+
+                    let modjson: Value = json.clone();
+
+                    //merge json (update json) with orig json data
+                    let mergedjson = merge(&origjson, &modjson,&key_set);
+                    //insert merged json 
+                    self.insert_duplicate_frmObject(&mergedjson, timestamp);  
+
+                }
+            }
+        }
+        else{
+            self.log_message(&format!("{}-0-0-D-I-{}", timestamp,"Record_not_found"))?;
+
         }
         let lines = vec![
             String::from("done")
@@ -3779,7 +3832,7 @@ pub fn delete_using_pointerVector(&mut self,
                                 };
 
                                 // ignore if record marked as deleted
-                                if key_record_len > ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
+                                if key_record_len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
                                     continue;
                                 }
 
@@ -4619,7 +4672,7 @@ pub fn delete_using_pointerVector(&mut self,
                                 };
 
                                 // ignore if record marked as deleted
-                                if key_record_len > ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
+                                if key_record_len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY {
                                     continue;
                                 }
 
@@ -5254,6 +5307,13 @@ pub fn delete_using_pointerVector(&mut self,
         Ok(map)
     }
 
+    pub fn log_error_message(&mut self, message: &str) -> std::io::Result<()> {
+        writeln!(self.errorlog_file, "{}", message)?;
+        self.errorlog_file.flush()?;
+
+        Ok(())
+    }
+
     pub fn log_message(&mut self, message: &str) -> std::io::Result<()> {
         if(self.settings.debugmode){
             println!("message: {}", &message.chars().take(self.settings.maxlogtoconsolelength).collect::<String>());
@@ -5413,9 +5473,11 @@ pub fn recover(
     let mut ts_11_raw_insertduplicate: BTreeMap<String, String> = BTreeMap::new();     // latest raw '11-update' per ts
 
     let mut ts_11_raw_all: BTreeSet<String> = BTreeSet::new();
+    let mut R_11_raw_all: BTreeSet<String> = BTreeSet::new();
 
-    // inline ts parser used only to decide when to start (first 11 after cutoff)
-    let mut parse_ts_to_utc = |ts: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+    // inline ts parser function used only to decide when to start (first 11 after cutoff)
+    let mut parse_ts_to_utc 
+                = |ts: &str| -> Option<chrono::DateTime<chrono::Utc>> {
         use chrono::{DateTime, NaiveDateTime, Utc};
 
         // RFC 3339
@@ -5456,13 +5518,14 @@ pub fn recover(
 
         None
     };
+    ///// parser function till here //////////
 
     // ===================== PASS 1: top→bottom =====================
     let file = File::open(&log_path)?;
     let mut rdr  = BufReader::new(file);
     let mut cutoff_utc: DateTime<Utc> = Utc::now();;
 
-    if(self.settings.sanitycheckgobacksec != 0){
+    if(seconds_back != 0){
         let mut file_eof = std::fs::File::open(&log_path)?;
         let mut pos = file_eof.seek(SeekFrom::End(0))?;
         // keep trying previous lines until parse succeeds or BOF
@@ -5489,7 +5552,7 @@ pub fn recover(
                 }
             }
 
-            // if we’re at BOF and didn’t collect anything, file is empty / no more lines
+            // if we’re at EOF and didn’t collect anything, file is empty / no more lines
             if pos == 0 && line.is_empty() {
                 break;
             }
@@ -5585,63 +5648,72 @@ pub fn recover(
                 let rest_is_done = rest.eq_ignore_ascii_case("Done");
                 if op_is_done || rest_is_done {
                     // Remove regardless of which map currently has the key.
-                    ts_11_raw_update.remove(ts);
-                    ts_11_raw_delete.remove(ts);
-                    ts_11_raw_updateall.remove(ts);
-                    ts_11_raw_deleteall.remove(ts);
-                    ts_11_raw_undo.remove(ts);
-                    ts_11_raw_insert.remove(ts);
-                    ts_11_raw_insertduplicate.remove(ts);
-                    let _ = ts_lines.remove(ts);
+                    //ts_11_raw_update.remove(ts);
+                    //ts_11_raw_delete.remove(ts);
+                    //ts_11_raw_updateall.remove(ts);
+                    //ts_11_raw_deleteall.remove(ts);
+                    //ts_11_raw_undo.remove(ts);
+                    //ts_11_raw_insert.remove(ts);
+                    //ts_11_raw_insertduplicate.remove(ts);
+                    //let _ = ts_lines.remove(ts);
                     // continue; // (optional) make intent explicit
                 }
             }
 
             // '11-update' → refresh latest raw 11 ONLY (no ts_lines entry)
             "11" =>{
-                match  op{
-                     "update" => {
-                        ts_11_raw_update.insert(ts.to_string(), line.clone());
-                     }
-                     "delete" => {
-                        ts_11_raw_delete.insert(ts.to_string(), line.clone());
-                     }
-                     "updateall" => {
-                        ts_11_raw_updateall.insert(ts.to_string(), line.clone());
-                     }
-                     "deleteall" => {
-                        ts_11_raw_deleteall.insert(ts.to_string(), line.clone());
-                     }
-                     "undo" => {
-                        ts_11_raw_undo.insert(ts.to_string(), line.clone());
-                     }
-                     "insert" => {
-                        ts_11_raw_insert.insert(ts.to_string(), line.clone());
-                     }
-                     "insertduplicate" => {
-                        ts_11_raw_insertduplicate.insert(ts.to_string(), line.clone());
-                     }
-                     _ => {}
+                if(!R_11_raw_all.contains(ts)){
+                    match  op{
+                        "update" => {
+                            ts_11_raw_update.insert(ts.to_string(), line.clone());
+                        }
+                        "delete" => {
+                            ts_11_raw_delete.insert(ts.to_string(), line.clone());
+                        }
+                        "updateall" => {
+                            ts_11_raw_updateall.insert(ts.to_string(), line.clone());
+                        }
+                        "deleteall" => {
+                            ts_11_raw_deleteall.insert(ts.to_string(), line.clone());
+                        }
+                        "undo" => {
+                            ts_11_raw_undo.insert(ts.to_string(), line.clone());
+                        }
+                        "insert" => {
+                            ts_11_raw_insert.insert(ts.to_string(), line.clone());
+                        }
+                        "insertduplicate" => {
+                            ts_11_raw_insertduplicate.insert(ts.to_string(), line.clone());
+                        }
+                        _ => {}
+                    }
                 }
             }
 
             // '1' / '0' → keep only if we've seen an '11' for this ts
             "1" | "0" => {
-                if (ts_11_raw_update.contains_key(ts) 
-                    ||
-                    ts_11_raw_delete.contains_key(ts) 
-                    ||
-                    ts_11_raw_updateall.contains_key(ts) 
-                    ||
-                    ts_11_raw_deleteall.contains_key(ts) 
-                    ||
-                    ts_11_raw_undo.contains_key(ts) 
-                    ||
-                    ts_11_raw_insert.contains_key(ts)
-                    ||
-                    ts_11_raw_insertduplicate.contains_key(ts)){
-                    ts_lines.entry(ts.to_string()).or_default().push(line);
+                //insert only if it doesn't exist in R_11_raw_all
+                if(!R_11_raw_all.contains(ts)){
+                    if (ts_11_raw_update.contains_key(ts) 
+                        ||
+                        ts_11_raw_delete.contains_key(ts) 
+                        ||
+                        ts_11_raw_updateall.contains_key(ts) 
+                        ||
+                        ts_11_raw_deleteall.contains_key(ts) 
+                        ||
+                        ts_11_raw_undo.contains_key(ts) 
+                        ||
+                        ts_11_raw_insert.contains_key(ts)
+                        ||
+                        ts_11_raw_insertduplicate.contains_key(ts)){
+                        ts_lines.entry(ts.to_string()).or_default().push(line);
+                    }
                 }
+
+            }
+            "R" =>{
+                R_11_raw_all.insert(ts.to_string());
             }
 
             _ => {}
@@ -5676,6 +5748,25 @@ pub fn recover(
         if let Some(raw11) = ts_11_raw_update.get(tsu).or(ts_11_raw_updateall.get(tsu)) {
             let mut reqs: HashMap<String, ReqState> = HashMap::new();
             let mut linesfound = false;
+
+            let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
+            let _ts   = it.next().unwrap_or("");
+            let code  = it.next().unwrap_or("");
+            let op    = it.next().unwrap_or("");
+            let rest  = it.next().unwrap_or("");
+            let json: serde_json::Value = serde_json::from_str(rest)?;
+
+            let file_name: String = json["keyobj"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
+                .to_string();
+
+
+            // now borrow immutably; multiple & borrows may overlap
+            let empty: BTreeMap<usize, usize> = BTreeMap::new();
+            let key_lines: &BTreeMap<usize, usize> =
+                self.file_key_line_map.get(&file_name).unwrap_or(&empty);
+
             if let Some(lines_vec) = ts_lines.get(tsu) {
                 linesfound = true;
                 let rs = reqs.entry(tsu.clone()).or_default();
@@ -5708,23 +5799,71 @@ pub fn recover(
                                                     }
                                         }
                                     }
+                                    let mut recorddeleted = false;
+                                    if need_d { 
+                                        rs.expect_d.insert(base_ptr); 
+                                        rs.count_d = op_count;
 
-                                    if need_d { rs.expect_d.insert(base_ptr); rs.count_d = op_count}
-                                    if need_i { rs.expect_i.insert(base_ptr); rs.count_i = op_count}
+                                        //check if record was deleted
+                                        //check if base_ptr points to a deleted record
+                                        //check if record was deleted at the backend
+                                        //before marking it done
+                                        if key_lines
+                                            .get(&base_ptr)
+                                            .map_or(false, |&len| len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY)
+                                        {
+                                            rs.done_d.insert(base_ptr);
+                                            recorddeleted = true;
+                                        }
+                                    }
+                                    if need_i { 
+                                        rs.expect_i.insert(base_ptr); 
+                                        rs.count_i = op_count;
+
+                                        //check if record was inserted
+                                        //check if record corresponding to num was inserted
+                                        //need to check only recorddeleted = true, as if record is not
+                                        //deleted, no way it was instered as records are deleted first
+                                        let mut insertrecordfound = false;
+                                        if(recorddeleted){
+                                            match self.print_line_forpointer_uselen(&file_name, base_ptr, true) {
+                                                Ok(line) => {
+                                                    let restorejson = extract_json(&line,self.settings.recorddelimiter);
+                                                    let mut restoreprimkey_map: IndexMap<String, String> = self.extract_prim_keyname_value_map(&restorejson)?;
+                                                    //update recid with the timestamp as for undo records are inserted with new timestamp
+                                                    restoreprimkey_map.insert("recid".to_string(), _ts.to_string());
+                                                    if let Some(restoreptrs) = self.get_fromkey_onlypointers(&file_name, &restoreprimkey_map) {
+                                                        if(restoreptrs.len() > 0){
+                                                            //corresponding record was inserted
+                                                            rs.done_i.insert(base_ptr);
+                                                            insertrecordfound = true;
+                                                        }
+                                                    }
+                                                    //check again in deleted records
+                                                    if(!insertrecordfound){
+                                                        if let Some(restoreptrs) = self.get_fromkey_onlypointersForDeleted(&file_name, &restoreprimkey_map) {
+                                                            if(restoreptrs.len() > 0){
+                                                                //corresponding record was inserted
+                                                                rs.done_i.insert(base_ptr);
+                                                                insertrecordfound = true;
+                                                            }
+                                                        }                                                                    
+                                                    }                                                    
+                                                        
+                                                }
+                                                Err(e) => {
+                                                    //record not found
+                                                    //do nothing
+                                                }
+                                    
+                                            } 
+                                        }                                       
+                                    }
                                 }
                             }
                         }
                         "0" => {
-                            let is_digits = !op.is_empty() && op.as_bytes().iter().all(|b| b.is_ascii_digit());
-                            if is_digits {
-                                if let Ok(p) = op.parse::<usize>() {
-                                    match rest {
-                                        "D" => { rs.done_d.insert(p); }
-                                        "I" => { rs.done_i.insert(p); }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            //no need to do anything as records are validated in "1"
                         }
                         _ => {}
                     }
@@ -5732,7 +5871,7 @@ pub fn recover(
                 //total count of operations will be mentioned in the last part
                 //so need to make sure that all pts are mentioned by checking
                 //if pts mentioned matches the count, as its possible that log
-                //go interrupted. This will handle situations wherein 4 records
+                //got interrupted. This will handle situations wherein 4 records
                 //were to be updated, but in log only 3 'T' records are mentioned
                 if(rs.count_i != rs.expect_i.len() || rs.count_d != rs.expect_d.len()){
                     linesfound = false;
@@ -5743,19 +5882,6 @@ pub fn recover(
             
             if(linesfound){
                 if let Some(rs) = reqs.get_mut(tsu) {
-                    let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
-                    let _ts   = it.next().unwrap_or("");
-                    let code  = it.next().unwrap_or("");
-                    let op    = it.next().unwrap_or("");
-                    let rest  = it.next().unwrap_or("");
-        
-                    let json: serde_json::Value = serde_json::from_str(rest)?;
-
-                    let file_name: String = json["keyobj"]
-                        .as_str()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
-                        .to_string();
-
                     rs.op = op.to_string();
 
                     // ---- 1) Build pointer vectors (pending work) ----
@@ -5764,11 +5890,11 @@ pub fn recover(
                     let mut ins_ptrs: Vec<usize> =
                         rs.expect_i.difference(&rs.done_i).copied().collect();
 
-                    // (optional but good for determinism)
-                    del_ptrs.sort_unstable();
-                    del_ptrs.dedup();
-                    ins_ptrs.sort_unstable();
-                    ins_ptrs.dedup();
+                    // (optional but good for determinism), not sure if needed
+                    //del_ptrs.sort_unstable();
+                    //del_ptrs.dedup();
+                    //ins_ptrs.sort_unstable();
+                    //ins_ptrs.dedup();
 
                     if(!(del_ptrs.is_empty() && ins_ptrs.is_empty())){
                         // mirror your intention logs
@@ -5792,29 +5918,31 @@ pub fn recover(
                             self.log_message(&format!("{}-1-{}-T-I", tsu, p))?;
                         }
 
-                        // primkey → merge → dedupe → insert
-                        let mut key_map: IndexMap<String, String> = IndexMap::new();
-                        if json.get("primkey").is_some() {
-                            key_map = self.extract_prim_keyname_value_map(&json)?;
 
-                        }
-                        let key_set: HashSet<&str> = key_map.keys().map(|s| s.as_str()).collect();
 
                         for &base_ptr in &ins_ptrs {
                             let origrec  = self.print_line_forpointer_uselen(&file_name, base_ptr, true)?;
                             let origjson = extract_json(&origrec, self.settings.recorddelimiter);
                             let modjson  = json.clone();
+                            // primkey → merge → dedupe → insert
+                            let mut key_map 
+                                        = self.extract_prim_keyname_value_map(&origjson)?;
+                            key_map.entry("primkey".to_string()).or_insert("".to_string());   
+
+
+
+                            let key_set: HashSet<&str> = key_map.keys().map(|s| s.as_str()).collect();
 
                             if !origjson.is_null() {
-                                let mergedjson = merge(&origjson, &modjson, &key_set);
+                                let mergedjson = merge(&origjson,&modjson,  &key_set);
                                 self.insert_duplicate_frmObject(&mergedjson, &tsu);
-
 
                             }
                         }
+                        // final marker 
+                        let _ = self.log_message(&format!("{tsu}-00-Done"));                          
                     }
-                    // final marker 
-                    let _ = self.log_message(&format!("{tsu}-00-Done"));            
+          
 
                 }   
             }
@@ -5839,6 +5967,23 @@ pub fn recover(
         else if let Some(raw11) = ts_11_raw_delete.get(tsu).or(ts_11_raw_deleteall.get(tsu)) {
             let mut reqs: HashMap<String, ReqState> = HashMap::new();
             let mut linesfound = false;
+
+            let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
+            let _ts   = it.next().unwrap_or("");
+            let code  = it.next().unwrap_or("");
+            let op    = it.next().unwrap_or("");
+            let rest  = it.next().unwrap_or("");
+            let json: serde_json::Value = serde_json::from_str(rest)?;
+
+            let file_name: String = json["keyobj"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
+                .to_string();
+
+            let empty: BTreeMap<usize, usize> = BTreeMap::new();
+            let key_lines: &BTreeMap<usize, usize> =
+                self.file_key_line_map.get(&file_name).unwrap_or(&empty);
+
             if let Some(lines_vec) = ts_lines.get(tsu) {
                 linesfound = true;
                 let rs = reqs.entry(tsu.clone()).or_default();
@@ -5850,7 +5995,6 @@ pub fn recover(
                     let code = it.next().unwrap_or("");
                     let op   = it.next().unwrap_or("");
                     let rest = it.next().unwrap_or("");
-
                     match code {
                         "1" => {
                             let is_digits = !op.is_empty() && op.as_bytes().iter().all(|b| b.is_ascii_digit());
@@ -5878,7 +6022,16 @@ pub fn recover(
                             if is_digits {
                                 if let Ok(p) = op.parse::<usize>() {
                                     match rest {
-                                        "D" => { rs.done_d.insert(p); }
+                                        "D" => { 
+                                            //check if record was deleted at the backend
+                                            //before marking it done
+                                            if key_lines
+                                                .get(&p)
+                                                .map_or(false, |&len| len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY)
+                                            {
+                                                rs.done_d.insert(p);
+                                            }  
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -5891,7 +6044,7 @@ pub fn recover(
                 //so need to make sure that all pts are mentioned by checking
                 //if pts mentioned matches the count, as its possible that log
                 //go interrupted. This will handle situations wherein 4 records
-                //were to be updated, but in log only 3 'T' records are mentioned
+                //were to be deleted, but in log only 3 'T' records are mentioned
                 if(rs.count_d != rs.expect_d.len()){
                     linesfound = false;
                 }           
@@ -5901,31 +6054,12 @@ pub fn recover(
             
             if(linesfound){
                 if let Some(rs) = reqs.get_mut(tsu) {
-                    let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
-                    let _ts   = it.next().unwrap_or("");
-                    let code  = it.next().unwrap_or("");
-                    let op    = it.next().unwrap_or("");
-                    let rest  = it.next().unwrap_or("");
-        
-                    let json: serde_json::Value = serde_json::from_str(rest)?;
-
-                    let file_name: String = json["keyobj"]
-                        .as_str()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
-                        .to_string();
 
                     rs.op = op.to_string();
 
                     // ---- 1) Build pointer vectors (pending work) ----
                     let mut del_ptrs: Vec<usize> =
                         rs.expect_d.difference(&rs.done_d).copied().collect();
-                    let mut ins_ptrs: Vec<usize> =
-                        rs.expect_i.difference(&rs.done_i).copied().collect();
-
-                    // (optional but good for determinism)
-                    del_ptrs.sort_unstable();
-                    del_ptrs.dedup();
-
 
                     // ---- 2a) Process pending deletes ----
                     if !del_ptrs.is_empty() {
@@ -5937,10 +6071,10 @@ pub fn recover(
                         }
                         // idempotent batch delete
                         self.delete_using_pointerVector(&file_name, del_ptrs.clone(), "d".to_string(), &tsu);
+                        // final marker 
+                        let _ = self.log_message(&format!("{tsu}-00-Done"));            
                     }
 
-                    // final marker 
-                    let _ = self.log_message(&format!("{tsu}-00-Done"));            
 
                 }   
             }
@@ -5966,19 +6100,29 @@ pub fn recover(
                 = ts_11_raw_insert.get(tsu).or(ts_11_raw_insertduplicate.get(tsu)) {
             let mut reqs: HashMap<String, ReqState> = HashMap::new();
             let mut reqs: HashMap<String, ReqState> = HashMap::new();
-            let mut linesfound = true;
+            let mut linesfound = false;
+
+            let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
+            let _ts   = it.next().unwrap_or("");
+            let code  = it.next().unwrap_or("");
+            let op    = it.next().unwrap_or("");
+            let rest  = it.next().unwrap_or("");
+            let json: serde_json::Value = serde_json::from_str(rest)?;
+
+            let file_name: String = json["keyobj"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
+                .to_string();
+
             if let Some(lines_vec) = ts_lines.get(tsu) {
                 let rs = reqs.entry(tsu.clone()).or_default();
-                //230825071853155767-1-1728-T-I
-                //230825071853155767-0-1728-D
                 //230825071853155767-0-2326-I
                 for line in lines_vec {
                     let mut it = line.splitn(4, self.settings.indexnamevaluedelimiter);
                     let _ts  = it.next().unwrap_or("");
                     let code = it.next().unwrap_or("");
                     let op   = it.next().unwrap_or("");
-                    let rest = it.next().unwrap_or("");
-
+                    let rest = it.next().unwrap_or("");                    
                     match code {
                         "0" => {
                             let is_digits = !op.is_empty() && op.as_bytes().iter().all(|b| b.is_ascii_digit());
@@ -5991,9 +6135,18 @@ pub fn recover(
                                             //Note that only 1 record at a time is inserted
                                             //so any '0' would indicate that last insert was 
                                             //successful
-                                            linesfound = false; 
-                                            self.log_message(&format!("{}-R-insert-{}", tsu, rest.clone()))?;
-                                            self.log_message(&format!("{tsu}-00-Done"));
+
+                                            //but do make sure that record exist before doing so
+                                            let exists: bool = self.file_key_line_map
+                                                .get(&file_name)                   // Option<&BTreeMap<usize, usize>>
+                                                .map_or(false, |m| m.contains_key(&p));  // false if None                                           
+
+                                            if(exists)
+                                            {
+                                                linesfound = true; 
+
+                                            }                                             
+
                                         }
                                         _ => {}
                                     }
@@ -6005,7 +6158,7 @@ pub fn recover(
                 }
                    
             }
-            if(linesfound){
+            if(!linesfound){
 
                 if(ts_11_raw_insertduplicate.contains_key(tsu)){
 
@@ -6052,89 +6205,137 @@ pub fn recover(
         if let Some(raw11) = ts_11_raw_undo.get(tsu) {
             let mut reqs: HashMap<String, ReqState> = HashMap::new();
             let mut linesfound = false;
+            let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
+            let _ts   = it.next().unwrap_or("");
+            let code  = it.next().unwrap_or("");
+            let op    = it.next().unwrap_or("");
+            let rest  = it.next().unwrap_or("");
+            let json: serde_json::Value = serde_json::from_str(rest)?;
+
+            let file_name: String = json["keyobj"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
+                .to_string();
+
+            let empty: BTreeMap<usize, usize> = BTreeMap::new();
+
+            let key_lines: &BTreeMap<usize, usize> =
+                self.file_key_line_map.get(&file_name).unwrap_or(&empty); 
             if let Some(lines_vec) = ts_lines.get(tsu) {
-                
                 let rs = reqs.entry(tsu.clone()).or_default();
                 //230825050212263942-11-undo-{...}
-                //230825050212263942-1-452839462-D-6014-I or 230825050212263942-1-6014-I
+                //230825050212263942-1-452-D-6014-I or 2308-1-6014-I
                 //230825050212263942-0-452839462-D
                 //230825050212263942-0-3435-I
                 //230825050212263942-00-Done
                 for line in lines_vec {
-                    let mut it = line.splitn(4, self.settings.indexnamevaluedelimiter);
-                    //_ts-code-op-rest....
+                    let mut it = line.splitn(3, self.settings.indexnamevaluedelimiter);
                     let _ts  = it.next().unwrap_or("");
-                    let code = it.next().unwrap_or(""); // 1 | 0
-                    let op   = it.next().unwrap_or(""); // <pointer>
-                    let rest = it.next().unwrap_or(""); //-D-...
-
+                    let code = it.next().unwrap_or("");
+                    let rest = it.next().unwrap_or("");
+                    let mut needonlyinsert = false;
+                    if rest.contains('T') { //'T' will be mentioned only for delete undo
+                        needonlyinsert = true;
+                    }                      
                     match code {
+
                         "1" => {
-                            let is_digits = !op.is_empty() && op.as_bytes().iter().all(|b| b.is_ascii_digit());
-                            if is_digits {
-                                if let Ok(base_ptr) = op.parse::<usize>() {
-                                    let mut need_d = false;
-                                    let mut need_i = false;
-                                    let mut op_count = 0;
+                            let mut need_d = false;
+                            let mut need_i = false;
+                            let mut op_count = 0;
+                          
+                            for t in rest.split(self.settings.indexnamevaluedelimiter) {
+                                match t {
+                                    "D" => {//will be taken care by 'other' match  
+                                    },
+                                    "I" => { //will be taken care by 'other' match                                           
+                                    },
+                                    "T" => { needonlyinsert = true; 
+                                        //undo for deleted record  e.g. 050925064924439408-1-636-T-I
+                                    },
+                                    other =>{ 
+                                                if(need_d || needonlyinsert){
 
-                                    for t in rest.split(self.settings.indexnamevaluedelimiter) {
-                                        match t {
-                                            "D" => {need_d = true; rs.expect_d.insert(base_ptr);linesfound = true;},
-                                            "I" => { 
-                                                if(!need_d){ 
-                                                    linesfound = true;
-                                                    need_i = true;
-                                                    rs.expect_i.insert(base_ptr);  // now type matches                                                           
-                                                }                                                
-                                            },
-                                            other =>{
-                                                        if(need_d){
-                                                            let is_digits = !other.is_empty() && other.as_bytes().iter().all(|other| other.is_ascii_digit());
-                                                            if let Ok(num) = other.parse::<usize>() {
-                                                                need_i = true;
-                                                                rs.expect_i.insert(num);  // now type matches
-                                                            }                                                            
+                                                    //delete set, so set insert
+                                                    let is_digits = !other.is_empty() && other.as_bytes().iter().all(|other| other.is_ascii_digit());
+                                                    if let Ok(num) = other.parse::<usize>() {
+                                                        need_i = true;
+                                                        rs.expect_i.insert(num);  
+                                                        let mut insertrecordfound = false;                                          
+                                                        //check if record corresponding to num was inserted
+                                                        match self.print_line_forpointer_uselen(&file_name, num, true) {
+                                                            Ok(line) => {
+                                                               let restorejson = extract_json(&line,self.settings.recorddelimiter);
+                                                               let mut restoreprimkey_map: IndexMap<String, String> = self.extract_prim_keyname_value_map(&restorejson)?;
+                                                               //update recid with the timestamp as for undo records are inserted with new timestamp
+                                                               restoreprimkey_map.insert("recid".to_string(), _ts.to_string());
+                                                                if let Some(restoreptrs) = self.get_fromkey_onlypointers(&file_name, &restoreprimkey_map) {
+                                                                    if(restoreptrs.len() > 0){
+                                                                        //corresponding record was inserted
+                                                                        rs.done_i.insert(num);
+                                                                        insertrecordfound = true;
+                                                                    }
+                                                                }
+                                                                //check again in deleted records
+                                                                if(!insertrecordfound){
+                                                                    if let Some(restoreptrs) = self.get_fromkey_onlypointersForDeleted(&file_name, &restoreprimkey_map) {
+                                                                        if(restoreptrs.len() > 0){
+                                                                            //corresponding record was inserted
+                                                                            rs.done_i.insert(num);
+                                                                            insertrecordfound = true;
+                                                                        }
+                                                                    }                                                                    
+                                                                }
+                                                                
+                                                                  
+                                                            }
+                                                            Err(e) => {
+                                                                println!("error : {}",e);
+                                                                //record not found
+                                                                //do nothing
+                                                            }
+                                                
                                                         }
-                                                    }
-                                        }
-                                    }
 
+
+                                                    }
+                                                    linesfound = true;
+
+                                                }
+                                                else{
+                                                    let is_digits = !other.is_empty() && other.as_bytes().iter().all(|other| other.is_ascii_digit());
+                                                    if let Ok(num) = other.parse::<usize>() {
+                                                        need_d = true; 
+                                                        rs.expect_d.insert(num);  
+
+                                                        //check if num points to a deleted record
+                                                        //check if record was deleted at the backend
+                                                        //before marking it done
+                                                        if key_lines
+                                                            .get(&num)
+                                                            .map_or(false, |&len| len >= ADD_TOMARK_REC_DELETE_IN_RECORDKEY)
+                                                        {
+                                                            rs.done_d.insert(num);
+                                                        }
+                                                    } 
+                                                    linesfound = true;
+                                                }
+                                            }
                                 }
+
                             }
                         }
                         "0" => {
-                            let is_digits = !op.is_empty() && op.as_bytes().iter().all(|b| b.is_ascii_digit());
-                            if is_digits {
-                                if let Ok(p) = op.parse::<usize>() {
-                                    match rest {
-                                        "D" => { rs.done_d.insert(p); }
-                                        "I" => { rs.done_i.insert(p); }
-                                        _ => {}
-                                    }
-                                }
+                                //nothing to do here as record validations are done in "1"
                             }
-                        }
                         _ => {}
                     }
                 }
-          
-                   
             }
             
             if(linesfound){
-                if let Some(rs) = reqs.get_mut(tsu) {
-                    let mut it = raw11.splitn(4, self.settings.indexnamevaluedelimiter);
-                    let _ts   = it.next().unwrap_or("");
-                    let code  = it.next().unwrap_or("");
-                    let op    = it.next().unwrap_or("");
-                    let rest  = it.next().unwrap_or("");
-        
-                    let json: serde_json::Value = serde_json::from_str(rest)?;
 
-                    let file_name: String = json["keyobj"]
-                        .as_str()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'keyobj'"))?
-                        .to_string();
+                if let Some(rs) = reqs.get_mut(tsu) {
 
                     rs.op = op.to_string();
 
@@ -6144,11 +6345,6 @@ pub fn recover(
                     let mut ins_ptrs: Vec<usize> =
                         rs.expect_i.difference(&rs.done_i).copied().collect();
 
-                    // (optional but good for determinism)
-                    del_ptrs.sort_unstable();
-                    del_ptrs.dedup();
-                    ins_ptrs.sort_unstable();
-                    ins_ptrs.dedup();
 
                     if(!(del_ptrs.is_empty() && ins_ptrs.is_empty())){
                         // mirror your intention logs
@@ -6182,10 +6378,10 @@ pub fn recover(
 
                             }
                         }
+                        // final marker 
+                        let _ = self.log_message(&format!("{tsu}-00-Done"));                          
                     }
-                    // final marker 
-                    let _ = self.log_message(&format!("{tsu}-00-Done"));            
-
+          
                 }   
             }
             else{

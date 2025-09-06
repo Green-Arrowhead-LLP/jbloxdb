@@ -72,7 +72,15 @@ low_ram_mode = false
 notoperator = "!"
 
 #sanity check time goback time in seconds
-sanitycheckgobacksec = 300
+sanitycheckgobacksec = 0
 
 #debugmode
 debugmode = false
+
+#if following mode is enabled, any OS error encountered
+#while writing the data to disc will be logged in jblox_error-<timestamp>.log
+#OS error encountered are rare, but they might occur. So, set this variable to 
+#true if data loss is not acceptable even in rare cases. If data loss is acceptable, for e.g.
+#in case of time series data, in rare cases, set following to false.
+#Setting this variable to true could slow down the insert operations by a factor of upto 5X
+strongdurablemode = false

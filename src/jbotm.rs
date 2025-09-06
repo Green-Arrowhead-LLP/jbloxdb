@@ -2881,6 +2881,12 @@ pub fn delete_using_pointerVector(&mut self,
         let mut restore_ptr: usize = 0;
 
         if let Some(ptrs) = self.get_fromkey_onlypointers(file_name, &key_map) {
+            if(ptrs.len() > 1){
+                //undo operation possible only when unique records can be identified
+                //using key specified
+                return Err(Error::new(ErrorKind::InvalidInput, 
+                    "Multiple records found for given primkey fields, make sure to use unique key"));                
+            }
             // collect into a mutable Vec (works whether ptrs is Vec or slice)
             //these are pointers to non-deleted records
             let mut sortedptrs: Vec<usize> = ptrs.iter().copied().collect();

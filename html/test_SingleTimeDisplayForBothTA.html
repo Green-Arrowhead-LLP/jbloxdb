@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Send JSON to Rust Server - Dual Textareas</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    .textarea-container {
+      display: flex;
+      gap: 10px;
+    }
+    textarea {
+      width: 96%;
+      height: 200px;
+      font-family: monospace;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 10px;
+      border: 1px solid #ccc;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .active-start {
+      background-color: #28a745;
+      color: white;
+    }
+    .active-stop {
+      background-color: #dc3545;
+      color: white;
+    }
+    #chartContainer {
+      width: 100%;
+      max-width: 800px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Send JSON to Rust Server (Dual Textareas)</h2>
+
+  <div class="textarea-container">
+    <div>
+      <label><b>JSON Textarea 1:</b></label><br>
+      <textarea id="jsonText1">{
+  "op": "insert",
+  "data": {
+    "primkey": "id,name,email",
+    "keyobj": "user",
+    "id": "user12345",
+    "name": "Alice James",
+    "email": "alice@example.com",
+    "phone": "+1-555-1234",
+    "address": "123 Main St, Springfield",
+    "dob": "1990-05-15",
+    "profile": {
+      "bio": "Software engineer with a passion for scalable systems and coffee.",
+      "website": "https://alicejames.dev",
+      "social": {
+        "twitter": "@alicej",
+        "linkedin": "linkedin.com/in/alicejames",
+        "github": "github.com/alicej"
+      },
+      "preferences": {
+        "language": "en-US",
+        "timezone": "America/New_York",
+        "notifications": {
+          "email": true,
+          "sms": false,
+          "push": true
+        },
+        "theme": "dark"
+      }
+    },
+    "security": {
+      "2fa_enabled": true,
+      "last_login": "2025-07-15T10:22:30Z",
+      "login_attempts": 3
+    },
+    "history": [
+      {
+        "login": "2025-07-10T09:15:20Z",
+        "ip": "192.168.1.10",
+        "device": "Chrome on Windows"
+      },
+      {
+        "login": "2025-07-08T14:05:55Z",
+        "ip": "192.168.1.22",
+        "device": "Firefox on macOS"
+      }
+    ],
+    "metadata": {
+      "created_at": "2023-04-01T12:00:00Z",
+      "updated_at": "2025-07-15T10:22:30Z",
+      "tags": ["admin", "beta-tester", "premium-user"]
+    },
+    "extra": {
+      "notes": "This user is part of the early access program. Provide priority support.",
+      "flags": {
+        "vip": true,
+        "restricted": false,
+        "beta_features": true
+      }
+    },
+    "logs": [
+      {"event": "password_change", "time": "2025-06-01T13:33:00Z"},
+      {"event": "email_update", "time": "2025-05-15T08:20:00Z"},
+      {"event": "2fa_enabled", "time": "2025-04-10T11:45:00Z"}
+    ]
+  }
+}</textarea>
+    </div>
+    <div>
+      <label><b>JSON Textarea 2:</b></label><br>
+      <textarea id="jsonText2">{
+  "op": "get",
+  "data": {
+    "key": "id,name,email",
+    "keyobj": "user",
+    "id": "user12345",
+    "name": "Alice James",
+    "email": "alice@example.com",
+    "phone": "+1-555-1234",
+    "address": "123 Main St, Springfield",
+    "dob": "1990-05-15",
+    "profile": {
+      "bio": "Software engineer with a passion for scalable systems and coffee.",
+      "website": "https://alicejames.dev",
+      "social": {
+        "twitter": "@alicej",
+        "linkedin": "linkedin.com/in/alicejames",
+        "github": "github.com/alicej"
+      },
+      "preferences": {
+        "language": "en-US",
+        "timezone": "America/New_York",
+        "notifications": {
+          "email": true,
+          "sms": false,
+          "push": true
+        },
+        "theme": "dark"
+      }
+    },
+    "security": {
+      "2fa_enabled": true,
+      "last_login": "2025-07-15T10:22:30Z",
+      "login_attempts": 3
+    },
+    "history": [
+      {
+        "login": "2025-07-10T09:15:20Z",
+        "ip": "192.168.1.10",
+        "device": "Chrome on Windows"
+      },
+      {
+        "login": "2025-07-08T14:05:55Z",
+        "ip": "192.168.1.22",
+        "device": "Firefox on macOS"
+      }
+    ],
+    "metadata": {
+      "created_at": "2023-04-01T12:00:00Z",
+      "updated_at": "2025-07-15T10:22:30Z",
+      "tags": ["admin", "beta-tester", "premium-user"]
+    },
+    "extra": {
+      "notes": "This user is part of the early access program. Provide priority support.",
+      "flags": {
+        "vip": true,
+        "restricted": false,
+        "beta_features": true
+      }
+    },
+    "logs": [
+      {"event": "password_change", "time": "2025-06-01T13:33:00Z"},
+      {"event": "email_update", "time": "2025-05-15T08:20:00Z"},
+      {"event": "2fa_enabled", "time": "2025-04-10T11:45:00Z"}
+    ]
+  }
+}</textarea>
+    </div>
+  </div>
+
+  <br>
+  <label><b>Interval (ms):</b></label>
+  <input type="number" id="interval" value="1000" min="100" step="100">
+  <br><br>
+  <button id="startBtn" onclick="startLoop()">Start Loop</button>
+  <button id="stopBtn" onclick="stopLoop()">Stop Loop</button>
+
+  <div id="chartContainer">
+    <canvas id="responseChart"></canvas>
+  </div>
+
+  <h3>Server Response:</h3>
+  <pre id="responseBox"></pre>
+
+  <script>
+    let loopActive = false;
+    let loopTimer = null;
+    let currentTextarea = 1;
+    let responseTimes = [];
+    let chartInstance = null;
+    let loopStartTime = 0;
+
+    async function sendJsonFromTextarea(textareaId) {
+      const textarea = document.getElementById(textareaId);
+      const responseBox = document.getElementById("responseBox");
+
+      let jsonData;
+      try {
+        jsonData = JSON.parse(textarea.value.trim());
+      } catch (err) {
+        responseBox.textContent = `Invalid JSON in ${textareaId}.`;
+        return;
+      }
+
+      try {
+        const startTime = performance.now();
+        const res = await fetch("/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(jsonData)
+        });
+        const endTime = performance.now();
+        const responseTime = (endTime - startTime).toFixed(2);
+        responseTimes.push(parseFloat(responseTime));
+
+        const resText = await res.text();
+        responseBox.textContent = `(${responseTime} ms) Response (${textareaId}): ${resText}`;
+
+        if (textareaId === "jsonText2" && resText.trim() === '{"data":{},"response":"ok"}') {
+          stopLoop();
+          responseBox.textContent += "\nLoop stopped: Response from textarea 2 matched {\"data\":{},\"response\":\"ok\"}";
+        }
+
+      } catch (err) {
+        responseBox.textContent = `Error sending ${textareaId}: ${err}`;
+      }
+    }
+
+    function startLoop() {
+      if (chartInstance) {
+        chartInstance.destroy();
+      }
+      responseTimes = [];
+      loopStartTime = performance.now();
+      const intervalMs = parseInt(document.getElementById("interval").value, 10) || 1000;
+      if (loopActive) return;
+      loopActive = true;
+      updateButtonStyles(true);
+
+      async function loopStep() {
+        if (!loopActive) return;
+
+        if (currentTextarea === 1) {
+          await sendJsonFromTextarea("jsonText1");
+          currentTextarea = 2;
+        } else {
+          await sendJsonFromTextarea("jsonText2");
+          currentTextarea = 1;
+        }
+
+        loopTimer = setTimeout(loopStep, intervalMs);
+      }
+
+      loopStep();
+    }
+
+    function stopLoop() {
+      loopActive = false;
+      if (loopTimer) clearTimeout(loopTimer);
+      updateButtonStyles(false);
+      displayResponseTimeGraph();
+    }
+
+    function displayResponseTimeGraph() {
+      const totalTimeSec = (performance.now() - loopStartTime) / 1000;
+      const responsesPerSec = (responseTimes.length / totalTimeSec).toFixed(2);
+      const ctx = document.getElementById('responseChart').getContext('2d');
+      if (chartInstance) {
+        chartInstance.destroy();
+      }
+      chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: responseTimes.map((_, i) => i + 1),
+          datasets: [{
+            label: 'Response Time (ms)',
+            data: responseTimes,
+            borderColor: 'blue',
+            fill: false
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            title: {
+              display: true,
+              text: `Response Times - ${responsesPerSec} responses/second`
+            }
+          },
+          scales: {
+            x: {
+              title: {
+                display: true,
+                text: 'Request Number'
+              }
+            },
+            y: {
+              title: {
+                display: true,
+                text: 'Time (ms)'
+              }
+            }
+          }
+        }
+      });
+    }
+
+    function updateButtonStyles(isRunning) {
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      if (isRunning) {
+        startBtn.classList.add("active-start");
+        stopBtn.classList.remove("active-stop");
+      } else {
+        startBtn.classList.remove("active-start");
+        stopBtn.classList.add("active-stop");
+      }
+    }
+  </script>
+</body>
+</html>
+</html>

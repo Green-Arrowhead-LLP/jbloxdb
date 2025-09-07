@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check for jblox.lck file
     let lock_file_path = Path::new(".").join("jblox.lck");
     if lock_file_path.exists() {
-        eprintln!("jblox.lck found in data directory. Another instance might be running.");
+        eprintln!("jblox.lck found in current directory. Another instance might be running.");
         process::exit(1);
     }
     // Create lock file

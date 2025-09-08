@@ -188,18 +188,6 @@ Examples:
 }
 ```
 
-**Delete:**
-```json
-{
-  "op": "delete",
-  "data": {
-    "key": "user_id",
-    "keyobj": "customer",
-    "user_id": "USR30495821"
-  }
-}
-```
-
 **Get:**
 ```json
 {
@@ -225,6 +213,29 @@ Examples:
 }
 ```
 
+**Delete:**
+```json
+{
+  "op": "delete",
+  "data": {
+    "primkey": "user_id",
+    "keyobj": "customer",
+    "user_id": "USR30495821"
+    }
+}
+```
+
+**Undo:**
+```json
+{
+  "op": "undo",
+  "data": {
+    "primkey": "user_id",
+    "keyobj": "customer",
+    "user_id": "USR30495821"
+    }
+}
+```
 --------
 
 Customization:
@@ -236,7 +247,7 @@ We recommend:
 
 Note: jbloxDB provides no built-in authentication or authorization. Your wrapper should handle security.
 
-jbloxDB is wrapper-agnostic — you can build custom wrappers using HTTP, messaging queues, etc.
+jbloxDB is wrapper-agnostic — you could build custom wrappers using HTTP, messaging queues, etc.
 
 --------
 

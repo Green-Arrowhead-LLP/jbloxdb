@@ -35,34 +35,25 @@ Usage:
 
 ### Start jbloxDB:
 
-(everytime jbloxDB runs, it creates jblox.lck file, at the same location as jbloxdb executable,
-to make sure only one instance is running at any given point of time. 
-So, before running jbloxDB make sure there are 
-no other instances of jbloxdb running, and remove jblox.lck if you need to.)
+(everytime jbloxDB runs, it creates jblox.lck file, in the current directory, to make sure only one instance is running at any given point of time. So, before running jbloxDB, make sure there are no other instances of jbloxdb running, and remove jblox.lck if you need to.)
 
 Microsoft Window:
 Prerequisite: 
-1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml,
-exists at the same location as jbloxdb.exe .(if config directory is not found, jbloxDB will
-check the parent directory, and so on, till it reaches base directory)
+1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml, exists at the same location as jbloxdb.exe . Make necessary changed to 'ip' in jbloxhttpsettings.toml if required. (if config directory is not found, jbloxDB will check the parent directory, and so on, till it reaches base directory)
 2. Make sure data; log; html directories mentioned in the toml files exist.
 
 Execute: jbloxdb.exe 
 
 Linux/Linux based OS
 
-1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml,
-exists at the same location as jbloxdb . (if config directory is not found, jbloxDB will
-check the parent directory, and so on, till it reaches base directory)
+1. Make sure 'config' directory, containing jbloxsettings.toml and jbloxhttpsettings.toml,exists at the same location as jbloxdb . Make necessary changed to 'ip' in jbloxhttpsettings.toml if required.(if config directory is not found, jbloxDB will check the parent directory, and so on, till it reaches base directory)
 2. Make sure data; log; html directories mentioned in the toml files exist.
 
 Execute: ./jbloxdb
 
 ### Stop jbloxDB:
 
-jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, every 60 seconds. 
-If file exists, jbloxDB will stop taking any new http requests and wait for 10 seconds to shutdown 
-jbloxDB.
+jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, every 60 seconds. If file exists, jbloxDB will stop taking any new http requests and wait for 10 seconds to shutdown jbloxDB.
 
 
 ### 📘 Request Format:
@@ -71,8 +62,9 @@ jbloxDB.
 {
   "op": "<operation>",
   "data": {
+    "primkey": "<comma-separated primary keys: only for insert; update; delete; undo>",
     "key": "<comma-separated keys>",
-    "keyobj": "<object name>",
+    "keyobj": "<object name: each keyobj has unique data file>",
     "recstart": "<record ID for pagination>",
     "id": "user12345",
     "name": "Alice James",
@@ -81,9 +73,10 @@ jbloxDB.
 }
 ```
 
-- `op` – required operation: `get`, `getall`, `insert`, `insertduplicate`, `update`, `updateall`, `delete`, or `deleteall`
-- `key` – the key(s) used for indexing; must match keys present in the JSON data
-- `keyobj` – the logical object being stored; each object is stored in a separate file
+- `op` – required operation: `get`, `getall`, `insert`, `insertduplicate`, `update`, `updateall`, `delete`, `deleteall`, `undo`
+- `primkey` – Elements in JSON for unique identification. This field is necessary for insert(all); update(all); delete(all); undo operations. Primary key element(s) cannot be modified for a JSON and will be ignored if present in 'update' operation. 
+- `key` – the key(s) used for indexing; must match keys present in the JSON data. JSON records could only be searched (and sorted) based on 'key' and 'primkey' elements. Elements can be added/removed from `key` using update operation.
+- `keyobj` – the logical object being stored; each object is stored in a separate file. Multiple object types, with completely different JSON representation, could however be saved in same file using same keyobj.
 - `recstart` – optional; used for pagination by providing the record ID from which to continue fetching
 
 ### ⚙ Operation Details:
@@ -102,7 +95,7 @@ jbloxDB.
 - **updateall**: Deletes all matching records before inserting new one
 - **delete**: Marks the latest matching record as deleted
 - **deleteall**: Deletes all matching records
-
+- **undo**: Restores previous JSON and mark current one as deleted. By default, last record with matching `primkey` is restored, this however can be changed through use of `undocount` which will Deletes all matching records
 *pagination via `recstart` is available to all 'get' requests
 --------
 

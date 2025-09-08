@@ -66,6 +66,7 @@ jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, e
     "key": "<comma-separated keys>",
     "keyobj": "<object name: each keyobj has unique data file>",
     "recstart": "<record ID for pagination>",
+    "sortbykey":<field name mentioned in key element>
     "id": "user12345",
     "name": "Alice James",
     "email": "alice@example.com"
@@ -77,7 +78,8 @@ jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, e
 - `primkey` – Elements in JSON for unique identification. This field is necessary for insert(all); update(all); delete(all); undo operations. Primary key element(s) cannot be modified for a JSON and will be ignored if present in 'update' operation. 
 - `key` – the key(s) used for indexing; must match keys present in the JSON data. JSON records could only be searched (and sorted) based on 'key' and 'primkey' elements. Elements can be added/removed from `key` using update operation.
 - `keyobj` – the logical object being stored; each object is stored in a separate file. Multiple object types, with completely different JSON representation, could however be saved in same file using same keyobj.
-- `recstart` – optional; used for pagination by providing the record ID from which to continue fetching
+- `recstart` – optional; used for pagination by providing record ID from which to continue fetching
+- `sortbykey` – optional; used for sorting records based on key element mentioned for this, in request for get(all) operation
 
 ### ⚙ Operation Details:
 
@@ -91,11 +93,11 @@ jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, e
 - **gethistalldesc**: Fetches records' history i.e. all records: deleted or updated, in descending order, matching any of the keys (OR logic)
 - **insert**: Inserts a new JSON record; duplicates not allowed
 - **insertduplicate**: Inserts even if a record with matching keys already exists
-- **update**: Marks old record as deleted, then inserts new one (requires full record)
-- **updateall**: Deletes all matching records before inserting new one
-- **delete**: Marks the latest matching record as deleted
-- **deleteall**: Deletes all matching records
-- **undo**: Restores previous JSON and mark current one as deleted. By default, last record with matching `primkey` is restored, this however can be changed through use of `undocount` which will Deletes all matching records
+- **update**: Inserts updated JSON after merging/overwriting elements mentioned in the request; and deleting existing JSON. Applies `AND` logic
+- **updateall**: Inserts updated JSON after merging/overwriting elements mentioned in the request; and deleting existing JSON. Applies `OR` logic
+- **delete**: Marks matching record(s) as deleted. Applies `AND` logic to the `key` elements
+- **deleteall**: Marks matching record(s) as deleted. Applies `OR` logic to the `key` elements
+- **undo**: Restores previous JSON and mark current one as deleted. By default, last record with matching `primkey` is restored, however, `undocount` could be used to identify historical record, older than previous record, to be restored
 *pagination via `recstart` is available to all 'get' requests
 --------
 
@@ -104,7 +106,7 @@ Data Storage:
 jbloxDB stores data in text files, with a separate file for each `keyobj`. No joins are supported across objects.
 
 Each record format:
-<status>-<timestamp>:<key1>-<val1>`<key2>-<val2>:<raw JSON>
+<status>-<timestamp>:<record-length>-<key-length>:<key1>-<val1>`<key2>-<val2>:<raw JSON>
 
 Status codes:
 - `00` – valid

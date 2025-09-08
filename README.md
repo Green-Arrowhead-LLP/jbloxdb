@@ -66,7 +66,7 @@ jbloxDB check for jblox.stop file, at the same location as jbloxdb executable, e
     "key": "<comma-separated keys>",
     "keyobj": "<object name: each keyobj has unique data file>",
     "recstart": "<record ID for pagination>",
-    "sortbykey":<field name mentioned in key element>
+    "sortbykey":"<field name mentioned in key element>",
     "id": "user12345",
     "name": "Alice James",
     "email": "alice@example.com"
@@ -137,7 +137,7 @@ Examples:
 {
   "op": "insert",
   "data": {
-    "key": "user_id,dob",
+    "primkey": "user_id,dob",
     "keyobj": "customer",
     "user_id": "USR30495821",
     "name": {
@@ -165,22 +165,22 @@ Examples:
 {
   "op": "update",
   "data": {
-    "key": "user_id,dob",
+    "primkey": "user_id",
     "keyobj": "customer",
     "user_id": "USR30495821",
     "name": {
-      "first": "Jordan",
-      "last": "Reynolds"
+      "first": "patrick",
+      "last": "Rafter"
     },
     "dob": "1992-04-18",
     "email": "jordan.reynolds@examplemail.com",
-    "phone": "+1-344-999-2000",
-    "address": {
-      "line1": "728 West Elm Street",
-      "line2": "Apt 4B",
+    "phone": "+1-303-555-0198",
+    "alternateaddress": {
+      "line1": "44, cross street",
+      "line2": "Larance",
       "city": "Denver",
       "state": "Colorado",
-      "postal_code": "80204",
+      "postal_code": "80209",
       "country": "USA"
     },
     "kyc_status": "Verified"

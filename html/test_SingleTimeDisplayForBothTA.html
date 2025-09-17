@@ -111,9 +111,7 @@
       {"event": "2fa_enabled", "time": "2025-04-10T11:45:00Z"}
     ]
   }
-}
-
-  </textarea>
+}</textarea>
   <br>
 
   <label><input type="checkbox" id="randomName"> Generate random name</label>
@@ -147,7 +145,7 @@
 
     async function uploadJson() {
       const fileInput = document.getElementById("jsonFile");
-      const textarea = document.getElementById("jsonText").trim();
+      const textarea = document.getElementById("jsonText");
       const responseBox = document.getElementById("responseBox");
       const imageContainer = document.getElementById("imageContainer");
       const randomNameCheckbox = document.getElementById("randomName");

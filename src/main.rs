@@ -41,6 +41,59 @@ struct Settings {
     maxbuffer:usize,
 }
 
+use std::str;
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    // index of the first byte of "\r\n\r\n"
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn split_header(line: &str) -> (&str, &str) {
+    if let Some(i) = line.find(':') { (&line[..i], &line[i+1..]) } else { (line, "") }
+}
+
+async fn write_400(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await
+}
+
+async fn write_411(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    socket.write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await
+}
+
+// Minimal chunked decoder good enough for JSON.
+// If you don't expect chunked, you can skip this and just return 411.
+enum ChunkParse { NeedMore, Done(Vec<u8>), Err }
+
+fn find_line_end(s: &[u8]) -> Option<usize> {
+    s.windows(2).position(|w| w == b"\r\n")
+}
+
+fn decode_chunked_try(src: &[u8]) -> ChunkParse {
+    let mut i = 0usize;
+    let mut out = Vec::<u8>::new();
+
+    loop {
+        let Some(end) = find_line_end(&src[i..]) else { return ChunkParse::NeedMore };
+        let line = &src[i..i+end];
+        let Ok(hex) = str::from_utf8(line) else { return ChunkParse::Err };
+        let Ok(size) = usize::from_str_radix(hex.trim(), 16) else { return ChunkParse::Err };
+        i += end + 2; // skip \r\n
+
+        if size == 0 {
+            // expect trailing CRLF
+            if src.len() < i + 2 { return ChunkParse::NeedMore; }
+            if &src[i..i+2] != b"\r\n" { return ChunkParse::Err; }
+            return ChunkParse::Done(out);
+        }
+
+        if src.len() < i + size + 2 { return ChunkParse::NeedMore; }
+        out.extend_from_slice(&src[i..i+size]);
+        i += size;
+        if &src[i..i+2] != b"\r\n" { return ChunkParse::Err; }
+        i += 2;
+    }
+}
+
 #[tokio::main]
 
 
@@ -146,164 +199,186 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let htmldir = settings.clone().htmldir;
         let defaultpage = settings.clone().defaultpage;
         tokio::spawn(async move {
+            // --- Read until headers complete ---
+            let mut buf = Vec::<u8>::with_capacity(MAXBUFFSIZE.max(8192));
+            let headers_end = loop {
+                let mut tmp = [0u8; 4096];
+                let Ok(n) = socket.read(&mut tmp).await else { return };
+                if n == 0 { return; } // client closed
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) = find_headers_end(&buf) {
+                    break idx; // index of first byte of "\r\n\r\n"
+                }
+                if buf.len() > MAXBUFFSIZE {
+                    // headers too large
+                    let _ = write_400(&mut socket).await;
+                    return;
+                }
+            };
 
-            let mut buffer = vec![0u8; MAXBUFFSIZE]; // Read buffer for incoming request
-            let Ok(n) = socket.read(&mut buffer).await else { return };
+            // headers as text
+            let headers_bytes = &buf[..headers_end];
+            let Ok(headers_str) = str::from_utf8(headers_bytes) else {
+                let _ = write_400(&mut socket).await;
+                return;
+            };
 
-            // Convert raw bytes to UTF-8 string
-            let request = String::from_utf8_lossy(&buffer[..n]);
-            //println!("Request:\n{}", request);
+            // Decide method from headers
+            let is_post = headers_str.starts_with("POST ");
+            if !is_post {
+                // ---- GET (or others): serve static file just like your code ----
+                let req_line = headers_str.lines().next().unwrap_or("");
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                let page: &str = if path == "/" { &defaultpage } else { path.trim_start_matches('/') };
+                let requested = Path::new(&htmldir).join(page);
 
-            // Parse the request line, e.g. "GET /foo.html HTTP/1.1"
+                let target = if requested.exists() { requested }
+                            else { Path::new(&htmldir).join(&defaultpage) };
 
+                let html = match std::fs::read_to_string(&target) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("Failed to read {}: {}", target.display(), e); return; }
+                };
 
-            // Check if the request is a POST
-            if request.starts_with("POST") {
-                // Find where the headers end and body begins
-                if let Some(headers_end) = request.find("\r\n\r\n") {
-                    let headers = &request[..headers_end];
-                    let body = &request[headers_end + 4..];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    Connection: close\r\n\r\n{}",
+                    html.as_bytes().len(),
+                    html
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                return;
+            }
 
-                    // Try to extract Content-Length header
-                    let content_length = headers
-                        .lines()
-                        .find(|line| line.to_lowercase().starts_with("content-length"))
-                        .and_then(|line| line.split(':').nth(1))
-                        .and_then(|val| val.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
+            // ---- POST: determine framing ----
+            let mut content_length: Option<usize> = None;
+            let mut chunked = false;
 
-                    // Serve static HTML if no content length is provided
-                    if content_length == 0 {
-                        match fs::read_to_string(format!("{}/{}", htmldir, defaultpage)) {
-                            Ok(html) => {
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n{}",
-                                    html.len(),
-                                    html
-                                );
-                                let _ = socket.write_all(response.as_bytes()).await;
+            for line in headers_str.lines().skip(1) {
+                let (name, val) = split_header(line);
+                if name.eq_ignore_ascii_case("content-length") {
+                    if let Ok(n) = val.trim().parse::<usize>() { content_length = Some(n); }
+                } else if name.eq_ignore_ascii_case("transfer-encoding") &&
+                        val.to_ascii_lowercase().contains("chunked") {
+                    chunked = true;
+                }
+            }
+
+            let body_start = headers_end + 4; // skip CRLFCRLF
+            let mut body = Vec::<u8>::new();
+
+            if let Some(cl) = content_length {
+                // Ensure we have the full body
+                let already = buf.len().saturating_sub(body_start);
+                if already >= cl {
+                    body.extend_from_slice(&buf[body_start..body_start + cl]);
+                } else {
+                    body.extend_from_slice(&buf[body_start..]);
+                    let mut remaining = cl - already;
+                    while remaining > 0 {
+                        let mut tmp = vec![0u8; remaining.min(4096)];
+                        let Ok(n) = socket.read(&mut tmp).await else { return };
+                        if n == 0 {
+                            let _ = write_400(&mut socket).await;
+                            return;
+                        }
+                        body.extend_from_slice(&tmp[..n]);
+                        remaining -= n;
+                        if body.len() > MAXBUFFSIZE {
+                            let _ = write_400(&mut socket).await;
+                            return;
+                        }
+                    }
+                }
+            } else if chunked {
+                // Minimal chunked decode
+                let mut stash = buf[body_start..].to_vec();
+                loop {
+                    match decode_chunked_try(&stash) {
+                        ChunkParse::NeedMore => {
+                            let mut tmp = [0u8; 4096];
+                            let Ok(n) = socket.read(&mut tmp).await else { return };
+                            if n == 0 {
+                                let _ = write_400(&mut socket).await;
+                                return;
                             }
-                            Err(e) => {
-                                let response = format!(
-                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
-                                    e.to_string().len(),
-                                    e
-                                );
-                                let _ = socket.write_all(response.as_bytes()).await;
+                            stash.extend_from_slice(&tmp[..n]);
+                            if stash.len() > MAXBUFFSIZE {
+                                let _ = write_400(&mut socket).await;
+                                return;
                             }
                         }
-                    } else {
-                        // Parse the body into JSON
-                        let body = &body[..content_length.min(body.len())];
-
-                        match serde_json::from_str::<Value>(body) {
-                            Ok(json) => {
-                                //println!("Parsed JSON: {:?}", json);
-
-                                let mut response_body = String::new();
-                                {
-                                    // Lock the shared handler
-                                    let mut h = handler.lock().await;
-
-                                    // Look for the "data" field in the JSON
-                                    if let Some(data_value) = json.get("data") {
-                                        // Call handler logic and build a JSON response
-                                        let result: Result<Vec<String>, std::io::Error> 
-                                            = h.handle_request(&json.to_string());
-
-
-                                        response_body = match result {
-                                            Ok(lines) => {
-                                                // Format the returned lines as Rec1, Rec2...
-                                                let data_obj: serde_json::Map<String, Value> = lines
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(i, line)| (format!("Rec{}", i + 1), json!(line)))
-                                                    .collect();
-
-                                                json!({
-                                                    "response": "ok",
-                                                    "data": Value::Object(data_obj)
-                                                }).to_string()
-                                            }
-                                            Err(e) => {
-                                                json!({
-                                                    "response": "error",
-                                                    "message": format!("{}", e)
-                                                }).to_string()
-                                            }
-                                        };
-                                    } else {
-                                        // Missing data field error
-                                        println!("'data' not found in JSON");
-                                        response_body = json!({
-                                            "response": "error",
-                                            "message": "'data' not found in input JSON"
-                                        }).to_string();
-                                    }
-                                }
-
-                                // Send formatted JSON response
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-                                    response_body.len(),
-                                    response_body
-                                );
-                                let _ = socket.write_all(response.as_bytes()).await;
-                            }
-                            Err(e) => {
-                                // Handle invalid JSON input
-                                let response = format!(
-                                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\nInvalid JSON: {}",
-                                    e.to_string().len(),
-                                    e
-                                );
-                                let _ = socket.write_all(response.as_bytes()).await;
-                            }
+                        ChunkParse::Done(full) => { body = full; break; }
+                        ChunkParse::Err => {
+                            let _ = write_400(&mut socket).await;
+                            return;
                         }
                     }
                 }
             } else {
-                // For GET or other methods, serve a static HTML file
-                let req_line = request.lines().next().unwrap_or("");
-                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
-                // Decide which file to serve: "/" → defaultpage, otherwise strip the leading '/'
-                let page: &str  = if path == "/" {
-                    &defaultpage
-                } else {
-                    &path[1..]  
-                };
-                // Build the filesystem path and try to read it
-                let requested = Path::new(&htmldir).join(page);
-                
-                // 2) Decide which file to read based on existence
-                let target = if requested.exists() {
-                    requested
-                } else {
-                    Path::new(&htmldir).join(defaultpage)
-                };
+                // Neither Content-Length nor chunked
+                let _ = write_411(&mut socket).await;
+                return;
+            }
 
-                let html = match std::fs::read_to_string(&target) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Failed to read {}: {}", target.display(), e);
-                        return;       // this returns from your async block (which is `()`), no `?` needed
+            // Now parse JSON (UTF-8)
+            let Ok(text) = String::from_utf8(body) else {
+                let _ = write_400(&mut socket).await;
+                return;
+            };
+
+            match serde_json::from_str::<Value>(&text) {
+                Ok(json) => {
+                    let mut response_body = String::new();
+                    {
+                        let mut h = handler.lock().await;
+
+                        if json.get("data").is_some() {
+                            let result: Result<Vec<String>, std::io::Error> = h.handle_request(&json.to_string());
+                            response_body = match result {
+                                Ok(lines) => {
+                                    let data_obj: serde_json::Map<String, Value> = lines
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, line)| (format!("Rec{}", i + 1), json!(line)))
+                                        .collect();
+                                    json!({"response": "ok", "data": Value::Object(data_obj)}).to_string()
+                                }
+                                Err(e) => json!({"response": "error", "message": e.to_string()}).to_string(),
+                            };
+                        } else {
+                            response_body = json!({"response": "error", "message": "'data' not found in input JSON"}).to_string();
+                        }
                     }
-                };
 
-                // now send the HTTP response
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                    Content-Length: {}\r\n\
-                    Content-Type: text/html\r\n\r\n\
-                    {}",
-                    html.len(),
-                    html
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-
+                    let resp_bytes = response_body.as_bytes();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json; charset=utf-8\r\n\
+                        Content-Length: {}\r\n\
+                        Connection: close\r\n\r\n{}",
+                        resp_bytes.len(),
+                        response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+                Err(e) => {
+                    let msg = format!("Invalid JSON: {}", e);
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\n\
+                        Content-Type: text/plain; charset=utf-8\r\n\
+                        Content-Length: {}\r\n\
+                        Connection: close\r\n\r\n{}",
+                        msg.as_bytes().len(),
+                        msg
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
             }
         });
+
     }
 }
 

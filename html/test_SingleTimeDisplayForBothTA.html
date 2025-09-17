@@ -147,7 +147,7 @@
 
     async function uploadJson() {
       const fileInput = document.getElementById("jsonFile");
-      const textarea = document.getElementById("jsonText");
+      const textarea = document.getElementById("jsonText").trim();
       const responseBox = document.getElementById("responseBox");
       const imageContainer = document.getElementById("imageContainer");
       const randomNameCheckbox = document.getElementById("randomName");

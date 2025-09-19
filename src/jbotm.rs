@@ -850,10 +850,10 @@ pub fn load_existing_file(
     let lines = file_line_map.entry(fname.clone()).or_insert_with(BTreeMap::new);
     let key_lines = file_key_line_map.entry(fname.clone()).or_insert_with(BTreeMap::new);
 
-    let keymap = file_key_pointer_map
+    let mut keymap = file_key_pointer_map
         .entry(fname.clone())
         .or_insert_with(HashMap::new);
-    let keymap_fordeleted = file_key_pointer_fordeleted_map
+    let mut keymap_fordeleted = file_key_pointer_fordeleted_map
         .entry(fname.clone())
         .or_insert_with(HashMap::new);
 
@@ -963,21 +963,47 @@ pub fn load_existing_file(
                 .collect();
 
             if let Ok(key_field) = String::from_utf16(&keystr_utf16) {
+            let target = 
+                    if is_zero { &mut keymap } else { &mut keymap_fordeleted };
+
                 for part in key_field.split(indexdelimiter) {
                     if let Some(dash_pos) = part.find(indexnamevaluedelimiter) {
                         let key_name = &part[..dash_pos];
                         let key_value = &part[dash_pos + 1..];
+                        if key_value.starts_with('[') && key_value.ends_with(']') {
+                            // Try to parse as JSON array of strings
+                            let mut inserted_any = false;
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(key_value) {
+                                for v in arr.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                                    target
+                                        .entry(key_name.to_string())
+                                        .or_default()
+                                        .entry(NumKey(v.into()))
+                                        .or_default()
+                                        .push(recptr);
+                                }
+                                inserted_any = true;
+                            }
 
-                        // NOTE: Keeping your original branch semantics intact.
-                        if is_zero {
-                            keymap
-                                .entry(key_name.to_string())
-                                .or_default()
-                                .entry(NumKey(key_value.into()))
-                                .or_default()
-                                .push(recptr);
+                            // Fallback: naive split if JSON parse fails
+                            if !inserted_any {
+                                let inner = &key_value[1..key_value.len() - 1]; // strip [ ]
+                                for v in inner
+                                    .split(',')
+                                    .map(|x| x.trim().trim_matches('"'))
+                                    .filter(|x| !x.is_empty())
+                                {
+                                    target
+                                        .entry(key_name.to_string())
+                                        .or_default()
+                                        .entry(NumKey((*v).into()))
+                                        .or_default()
+                                        .push(recptr);
+                                }
+                            }
                         } else {
-                            keymap_fordeleted
+                            // Single value case
+                            target
                                 .entry(key_name.to_string())
                                 .or_default()
                                 .entry(NumKey(key_value.into()))
@@ -1271,6 +1297,27 @@ pub fn new() -> io::Result<Self> {
 }
 
 
+    /// Weighted sum over numeric NumKey values,
+    /// weight = vec.len() for each entry.
+    /// Skips keys that fail to parse or aren't finite.
+    fn sum_from_btreemapptr(&self, map: &BTreeMap<NumKey, Vec<usize>>) -> f64 {
+        let mut sum = 0.0f64;
+
+        for (k, v) in map {
+            let w = v.len() as f64;
+            if w == 0.0 { continue; }
+
+            if let Ok(val) = k.0.parse::<f64>() {
+                if val.is_finite() {
+                    sum += val * w;
+                }
+            }
+        }
+
+        sum
+    }
+
+
     /// Weighted mean over f64 values parsed from NumKey.
     /// Weight for each key = vec.len() (number of records/pointers).
     /// Skips keys that fail to parse or aren't finite.
@@ -1295,6 +1342,22 @@ pub fn new() -> io::Result<Self> {
         }
 
         if sum_w == 0.0 { f64::NAN } else { mean }
+    }
+
+    fn sum_from_numkey_slice(&self, v: &[NumKey]) -> f64 {
+        let mut sum = 0.0f64;
+        let mut any = false;
+
+        for nk in v {
+            if let Ok(x) = nk.0.parse::<f64>() {
+                if x.is_finite() {
+                    sum += x;
+                    any = true;
+                }
+            }
+        }
+
+        if any { sum } else { f64::NAN }
     }
 
     fn mean_from_numkey_slice(&self,v: &[NumKey]) -> f64 {
@@ -2003,12 +2066,47 @@ pub fn append_line_and_track(&mut self, file_name: &str, new_line: &str, timesta
             if let Some(dash_pos) = part.find(indexnamevalue_delim.as_str()) {
                 let key_name = &part[..dash_pos];
                 let key_value = &part[dash_pos + 1..];
-                key_map
-                    .entry(key_name.to_string())
-                    .or_default()
-                    .entry(NumKey(key_value.into()))
-                    .or_default()
-                    .push(start);
+
+                if key_value.starts_with('[') && key_value.ends_with(']') {
+                    // First try: strict JSON array of strings
+                    let mut inserted_any = false;
+                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(key_value) {
+                        for v in arr.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                            key_map
+                                .entry(key_name.to_string())
+                                .or_default()
+                                .entry(NumKey(v.into()))
+                                .or_default()
+                                .push(start);
+                        }
+                        inserted_any = true;
+                    }
+
+                    // Fallback: naive split on commas, strip surrounding quotes
+                    if !inserted_any {
+                        let inner = &key_value[1..key_value.len() - 1]; // drop [ ]
+                        for v in inner
+                            .split(',')
+                            .map(|x| x.trim().trim_matches('"'))
+                            .filter(|x| !x.is_empty())
+                        {
+                            key_map
+                                .entry(key_name.to_string())
+                                .or_default()
+                                .entry(NumKey(v.into()))
+                                .or_default()
+                                .push(start);
+                        }
+                    }
+                } else {
+                    // Single value
+                    key_map
+                        .entry(key_name.to_string())
+                        .or_default()
+                        .entry(NumKey(key_value.into()))
+                        .or_default()
+                        .push(start);
+                }
             }
         }
     }
@@ -2175,7 +2273,7 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
     else{
         if let Some(obj) = json.as_object() {
         if let key_str = {
-            let pairs: Vec<(&str, &Value)> = self.extract_key_value_multiple_forInsert(&json);
+            let pairs = self.extract_key_value_multiple_forInsert(&json);
             let parts: Vec<String> = pairs
                 .into_iter()
                 .map(|(key, value)| {
@@ -2377,7 +2475,7 @@ pub fn insert_duplicate_frmObject(&mut self, json: &Value,timestamp: &str) -> st
 
         // Step 2: Extract key value from JSON
         let key_str = {
-            let pairs: Vec<(&str, &Value)> = self.extract_key_value_multiple_forInsert(&json);
+            let pairs = self.extract_key_value_multiple_forInsert(&json);
             let parts: Vec<String> = pairs
                 .into_iter()
                 .map(|(key, value)| {
@@ -2443,7 +2541,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
     None
 }
 
-    fn extract_key_value_multiple_forInsert<'a>(&self, json: &'a Value) -> Vec<(&'a str, &'a Value)> {
+    fn extract_key_value_multiple_forInsert_singlevalue<'a>(&self, json: &'a Value) -> Vec<(&'a str, &'a Value)> {
         let mut results = Vec::new();
 
         if let Some(obj) = json.as_object() {
@@ -2476,6 +2574,88 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         results
     }
 
+    pub fn extract_key_value_multiple_forInsert(&self, json: &Value) -> Vec<(String, Value)> {
+        // 1) Gather key names from "key" and "primkey"
+        let mut key_names: Vec<String> = Vec::new();
+        if let Some(obj) = json.as_object() {
+            if let Some(Value::String(keys)) = obj.get("key") {
+                key_names.extend(
+                    keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                );
+            }
+            if let Some(Value::String(keys)) = obj.get("primkey") {
+                key_names.extend(
+                    keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                );
+            }
+        }
+
+        // 2) Dedup while preserving order (owned to avoid &str variance issues)
+        let mut seen = FxHashSet::default();
+        key_names.retain(|k| seen.insert(k.clone()));
+
+        // Inline DFS to collect all matches for a key
+        fn collect_all<'a>(v: &'a Value, target: &str, out: &mut Vec<&'a Value>) {
+            match v {
+                Value::Object(map) => {
+                    if let Some(val) = map.get(target) {
+                        out.push(val);
+                    }
+                    for (_, child) in map {
+                        collect_all(child, target, out);
+                    }
+                }
+                Value::Array(arr) => {
+                    for item in arr {
+                        collect_all(item, target, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Flatten any depth of arrays into `flat` (keeps scalars as-is)
+        fn flatten_into(src: &Value, flat: &mut Vec<Value>) {
+            match src {
+                Value::Array(a) => {
+                    for item in a {
+                        flatten_into(item, flat);
+                    }
+                }
+                other => flat.push(other.clone()),
+            }
+        }
+
+        // 3) For each key, combine all values into a single flattened array if needed
+        let mut results: Vec<(String, Value)> = Vec::new();
+
+        for key_name in key_names {
+            let mut matches: Vec<&Value> = Vec::new();
+            collect_all(json, &key_name, &mut matches);
+
+            if matches.is_empty() {
+                continue; // keep "not found → skip"
+            }
+
+            // Flatten arrays across ALL matches
+            let mut flat: Vec<Value> = Vec::new();
+            for m in &matches {
+                flatten_into(m, &mut flat);
+            }
+
+            // If there is exactly one scalar after flattening, return it directly.
+            // Otherwise, return a single combined array.
+            let out_val = if flat.len() == 1 {
+                flat.pop().unwrap()
+            } else {
+                Value::Array(flat)
+            };
+
+            results.push((key_name, out_val));
+        }
+
+        results
+    }
 
     fn find_key_recursively<'a>(&self, json: &'a Value, key: &str) -> Option<&'a Value> {
         match json {
@@ -2599,6 +2779,7 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         }
        
         let ptrcount = ptrs.len();
+
         if(ptrcount > 0){
             for ptr in &ptrs {
                 self.log_message(&format!("{}-1-{}-T-D-{}", timestamp,ptr,ptrcount))?;
@@ -2608,6 +2789,8 @@ fn extract_keyobj_value<'a>(&self, json: &'a Value) -> Option<(&'a str, &'a Valu
         }
         else{
                 self.log_message(&format!("{}-0-0-D-{}", timestamp,"Record_Not_found"))?;
+                return Err(Error::new(ErrorKind::InvalidInput, 
+                        "Record Not found"));
         }
 
 
@@ -2733,26 +2916,72 @@ pub fn delete_using_pointerVector(&mut self,
                     if let Some(dash_pos) = part.find(self.settings.indexnamevaluedelimiter) {
                         let key_name = &part[..dash_pos];
                         let key_value = &part[dash_pos + 1..];
+                        // key_value is a &str you currently have
+                        let key_value_trimmed = key_value.trim();
 
-                        //add corresponding new record in file_key_pointer_fordeleted_map
-                        if let Some(mainrectree) = ptrmap.get_mut(key_name){
-                            let nk = NumKey::from(key_value.to_string());
-                            if let Some(mainrecvec) = mainrectree.get_mut(&nk){
-                                //delete ptr from ptrmap
-                                if let Some(pos) = mainrecvec.iter().position(|&x| x == ptr) {
-                                    mainrecvec.swap_remove(pos); // fast, but reorders
-                                }                                
+                        // 1) Expand to a list of string values (handles nested arrays; falls back to naive split)
+                        let mut vals: Vec<String> = Vec::new();
 
-                                //add to delete_ptrmap
-                                if let Some(delete_ptrmap) = & mut delete_ptrmap_opt {
+                        if key_value_trimmed.starts_with('[') && key_value_trimmed.ends_with(']') {
+                            // Try robust JSON parse (accept nested arrays)
+                            if let Ok(jv) = serde_json::from_str::<serde_json::Value>(key_value_trimmed) {
+                                fn collect_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+                                    match v {
+                                        serde_json::Value::String(s) => {
+                                            let s = s.trim();
+                                            if !s.is_empty() { out.push(s.to_string()); }
+                                        }
+                                        serde_json::Value::Array(a) => {
+                                            for it in a { collect_strings(it, out); }
+                                        }
+                                        // If you want only strings, omit this branch
+                                        other => {
+                                            let s = other.to_string();
+                                            if !s.is_empty() && s != "null" { out.push(s); }
+                                        }
+                                    }
+                                }
+                                collect_strings(&jv, &mut vals);
+                            }
+
+                            // Fallback: naive comma-split if JSON parsing failed
+                            if vals.is_empty() {
+                                let inner = &key_value_trimmed[1..key_value_trimmed.len() - 1]; // strip [ ]
+                                vals = inner
+                                    .split(',')
+                                    .map(|x| x.trim().trim_matches('"').to_string())
+                                    .filter(|x| !x.is_empty())
+                                    .collect();
+                            }
+                        } else {
+                            // Single (non-array) value
+                            vals.push(key_value_trimmed.to_string());
+                        }
+
+                        // 2) Apply your logic for EACH value in vals
+                        if let Some(mainrectree) = ptrmap.get_mut(key_name) {
+                            for v in &vals {
+                                let nk = NumKey::from(v.clone());
+
+                                if let Some(mainrecvec) = mainrectree.get_mut(&nk) {
+                                    // delete ptr from ptrmap
+                                    if let Some(pos) = mainrecvec.iter().position(|&x| x == ptr) {
+                                        mainrecvec.swap_remove(pos); // fast, reorders
+                                    }
+
+                                }
+
+                                // add to delete_ptrmap
+                                if let Some(delete_ptrmap) = &mut delete_ptrmap_opt {
                                     delete_ptrmap
                                         .entry(key_name.to_string())
-                                        .or_insert_with(BTreeMap::new)   // &mut BTreeMap<NumKey, Vec<usize>>
-                                        .entry(key_value.to_string().into())                       // Entry<NumKey, Vec<usize>>
-                                        .or_insert_with(Vec::new)        // &mut Vec<usize>
-                                        .push(ptr.clone()); 
-                                }                                        
-                            }   
+                                        .or_insert_with(BTreeMap::new)       // &mut BTreeMap<NumKey, Vec<usize>>
+                                        .entry(NumKey::from(v.clone()))       // Entry<NumKey, Vec<usize>>
+                                        .or_insert_with(Vec::new)             // &mut Vec<usize>
+                                        .push(ptr);
+                                }
+                            }
+
                         }
 
                     }
@@ -3077,6 +3306,8 @@ pub fn delete_using_pointerVector(&mut self,
         }
         else{
             self.log_message(&format!("{}-0-0-D-I-{}", timestamp,"Record_not_found"))?;
+            return Err(Error::new(ErrorKind::InvalidInput, 
+                        "Record Not found"));            
 
         }
         let lines = vec![
@@ -3981,6 +4212,16 @@ pub fn delete_using_pointerVector(&mut self,
                             }        
 
                         }
+                        else if(keyvalue.starts_with("sum("))
+                        {   
+                            if let Some(inner) = keydetailsmap.get(&key) {
+
+                                let mn  = self.sum_from_numkey_slice(inner);
+                                let resultstr 
+                                            = format!("{}->{}:{}",keyName,keyvalue,mn);
+                                result_lines.push(resultstr);
+                            }
+                        }
                         else if(keyvalue.starts_with("mean("))
                         {   
                             if let Some(inner) = keydetailsmap.get(&key) {
@@ -4171,6 +4412,16 @@ pub fn delete_using_pointerVector(&mut self,
                                     }
                                 }
 
+                            }
+                            else if(keyvalue.starts_with("sum("))
+                            {   
+                                if let Some(inner) = filtered_map_file.get(&key) {
+
+                                    let mn  = self.sum_from_btreemapptr(inner);
+                                    let resultstr 
+                                                = format!("{}->{}:{}",keyName,keyvalue,mn);
+                                    result_lines.push(resultstr);
+                                }
                             }
                             else if(keyvalue.starts_with("mean("))
                             {   
@@ -4820,6 +5071,16 @@ pub fn delete_using_pointerVector(&mut self,
                             }        
 
                         }
+                        else if(keyvalue.starts_with("sum("))
+                        {   
+                            if let Some(inner) = keydetailsmap.get(&key) {
+
+                                let mn  = self.sum_from_numkey_slice(inner);
+                                let resultstr 
+                                            = format!("{}->{}:{}",keyName,keyvalue,mn);
+                                result_lines.push(resultstr);
+                            }
+                        }
                         else if(keyvalue.starts_with("mean("))
                         {   
                             if let Some(inner) = keydetailsmap.get(&key) {
@@ -5010,6 +5271,16 @@ pub fn delete_using_pointerVector(&mut self,
                                     }
                                 }
 
+                            }
+                            else if(keyvalue.starts_with("sum("))
+                            {   
+                                if let Some(inner) = filtered_map_file.get(&key) {
+
+                                    let mn  = self.sum_from_btreemapptr(inner);
+                                    let resultstr 
+                                                = format!("{}->{}:{}",keyName,keyvalue,mn);
+                                    result_lines.push(resultstr);
+                                }
                             }
                             else if(keyvalue.starts_with("mean("))
                             {   
